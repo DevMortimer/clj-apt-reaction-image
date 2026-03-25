@@ -7,7 +7,7 @@ The project now has two stages:
 1. Index time:
    each image is analyzed once and stored as structured metadata.
 2. Query time:
-   typed text is matched against that metadata, then a rerank model picks the best reaction image from the shortlist.
+   typed text is first expanded into reaction intent/tags, then matched against that metadata, then a rerank model picks the best reaction image from the shortlist.
 
 ## Requirements
 

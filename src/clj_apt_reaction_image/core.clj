@@ -477,7 +477,49 @@
    :notes (:notes entry)
    :visible_text (clip-text (:visible-text entry) 200)})
 
-(defn- rerank-prompt [query candidates]
+(defn- query-analysis-prompt [query]
+  (str
+   "You are extracting reaction-search intent from a conversation snippet.\n"
+   "Return JSON only in this shape: "
+   "{\"query_text\":\"string\",\"intent\":\"string\",\"desired_reaction_tags\":[\"string\"],"
+   "\"tone\":[\"string\"],\"keywords\":[\"string\"]}\n"
+   "Rules:\n"
+   "- intent: one short sentence.\n"
+   "- desired_reaction_tags: max 6 short lowercase tags for the kind of reaction image that would fit.\n"
+   "- tone: max 4 short lowercase tags.\n"
+   "- keywords: max 6 short lowercase words or short phrases.\n"
+   "- Use the original text when possible, but infer likely reaction style if the text is colloquial.\n\n"
+   "Conversation snippet:\n"
+   query))
+
+(defn- normalize-query-profile [query payload]
+  {:query-text (or (non-blank (:query_text payload)) query)
+   :intent (or (non-blank (:intent payload)) "")
+   :desired-reaction-tags (lower-string-vec (:desired_reaction_tags payload))
+   :tone (lower-string-vec (:tone payload))
+   :keywords (lower-string-vec (:keywords payload))})
+
+(defn- analyze-query! [config query]
+  (let [response (ollama/chat! (:host config)
+                               (:rank-model config)
+                               (query-analysis-prompt query)
+                               {:format "json"
+                                :temperature 0.1})
+        payload (parse-json-content (ollama/assistant-content response))]
+    (normalize-query-profile query payload)))
+
+(defn- build-query-search-text [query profile]
+  (str/join
+   " "
+   (remove str/blank?
+           [query
+            (:intent profile)
+            (str/join " " (:desired-reaction-tags profile))
+            (str/join " " (:desired-reaction-tags profile))
+            (str/join " " (:tone profile))
+            (str/join " " (:keywords profile))])))
+
+(defn- rerank-prompt [query profile candidates]
   (str
    "You are choosing the best reaction image for a conversation snippet.\n"
    "Pick the single best candidate id from the provided metadata.\n"
@@ -490,13 +532,18 @@
    "- Keep reason to one short sentence.\n\n"
    "User query:\n"
    query
+   "\n\nAnalyzed intent:\n"
+   (json/write-str {:intent (:intent profile)
+                    :desired_reaction_tags (:desired-reaction-tags profile)
+                    :tone (:tone profile)
+                    :keywords (:keywords profile)})
    "\n\nCandidates:\n"
    (json/write-str (mapv candidate-summary candidates))))
 
-(defn- rerank-candidates! [config query candidates]
+(defn- rerank-candidates! [config query profile candidates]
   (let [response (ollama/chat! (:host config)
                                (:rank-model config)
-                               (rerank-prompt query candidates)
+                               (rerank-prompt query profile candidates)
                                {:format "json"
                                 :temperature 0.1})
         payload (parse-json-content (ollama/assistant-content response))
@@ -573,12 +620,23 @@
         entries (:entries index)]
     (when (empty? entries)
       (throw (ex-info "Index file is empty or missing entries" {:index-file (:index-file config)})))
-    (let [candidates (lexical-shortlist entries query-text (:candidate-count config))]
+    (let [profile (try
+                    (analyze-query! config query-text)
+                    (catch Exception _
+                      {:query-text query-text
+                       :intent ""
+                       :desired-reaction-tags []
+                       :tone []
+                       :keywords []}))
+          enhanced-query (build-query-search-text query-text profile)
+          _ (when (seq (:desired-reaction-tags profile))
+              (println (str "query tags: " (str/join ", " (:desired-reaction-tags profile)))))
+          candidates (lexical-shortlist entries enhanced-query (:candidate-count config))]
       (when (empty? candidates)
-        (println "No lexical matches found in the current index.")
+        (println "No semantic shortlist matches found in the current index.")
         (System/exit 2))
       (let [rerank (try
-                     (rerank-candidates! config query-text candidates)
+                     (rerank-candidates! config query-text profile candidates)
                      (catch Exception _
                        nil))
             ranked (if rerank

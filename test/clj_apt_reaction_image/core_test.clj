@@ -137,6 +137,17 @@
         ranked (#'core/lexical-shortlist entries "bro what disbelief" 5)]
     (is (= "a.jpg" (:id (first ranked))))))
 
+(deftest query-search-text-expands-semantic-intent
+  (let [profile {:intent "disbelief at unexpected message"
+                 :desired-reaction-tags ["disbelief" "speechless"]
+                 :tone ["casual"]
+                 :keywords ["unexpected"]}
+        search-text (#'core/build-query-search-text "bro what" profile)]
+    (is (str/includes? search-text "bro what"))
+    (is (str/includes? search-text "disbelief"))
+    (is (str/includes? search-text "speechless"))
+    (is (str/includes? search-text "unexpected"))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
