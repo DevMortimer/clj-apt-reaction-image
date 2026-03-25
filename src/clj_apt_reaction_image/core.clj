@@ -207,6 +207,8 @@
   (let [candidate (or (extract-json-object content) content)]
     (json/read-str candidate :key-fn keyword)))
 
+(declare empty-query-profile require-option)
+
 (defn- image-index-prompt [id ocr-text]
   (str
    "You are indexing one reaction image for retrieval.\n"
@@ -568,18 +570,42 @@
           (clip-text ocr-text 360)
           "\n\n"))))
 
-(defn- analyze-image-query! [config image-path ocr-text]
-  (let [image-file (io/file image-path)
-        prepared-image (prepare-vision-image! config image-file)
-        response (ollama/chat! (:host config)
+(defn- analyze-image-query! [config prepared-image ocr-text fallback-query]
+  (let [response (ollama/chat! (:host config)
                                (:rank-model config)
                                (image-query-analysis-prompt ocr-text)
                                {:images [prepared-image]
                                 :format "json"
                                 :temperature 0.1})
-        payload (parse-json-content (ollama/assistant-content response))
-        fallback-query (or (non-blank ocr-text) (.getName image-file) "image query")]
+        payload (parse-json-content (ollama/assistant-content response))]
     (normalize-query-profile fallback-query payload)))
+
+(defn- query-source-brief [{:keys [source-type source-image-path source-ocr-text]}]
+  (cond-> []
+    source-type
+    (conj (str "Query source type: " (name source-type) "."))
+
+    source-image-path
+    (conj "Use the attached image as the primary source of meaning.")
+
+    (non-blank source-ocr-text)
+    (conj (str "OCR hint: " (clip-text source-ocr-text 220)))))
+
+(defn- query-model-images [{:keys [prepared-source-image]}]
+  (cond-> []
+    prepared-source-image (conj prepared-source-image)))
+
+(defn- analyze-image-query-with-fallback! [config image-path ocr-text]
+  (let [image-file (io/file image-path)
+        prepared-image (prepare-vision-image! config image-file)
+        fallback-query (or (non-blank ocr-text) (.getName image-file) "image query")
+        profile (try
+                  (analyze-image-query! config prepared-image ocr-text fallback-query)
+                  (catch Exception _
+                    (empty-query-profile fallback-query)))]
+    {:prepared-source-image prepared-image
+     :profile profile
+     :query-text (:query-text profile)}))
 
 (defn- build-query-search-text [query profile]
   (str/join
@@ -592,7 +618,7 @@
             (str/join " " (:tone profile))
             (str/join " " (:keywords profile))])))
 
-(defn- rerank-prompt [query profile candidates]
+(defn- rerank-prompt [{:keys [query-text profile] :as query-context} candidates]
   (str
    "You are choosing the best reaction image for a conversation snippet.\n"
    "Pick the single best candidate id from the provided metadata.\n"
@@ -601,10 +627,12 @@
    "Rules:\n"
    "- best_id must be exactly one of the candidate ids.\n"
    "- alternate_ids may contain up to 3 other ids from the candidate list.\n"
-   "- Prefer images that feel like a reaction, not just a topical keyword match.\n"
-   "- Keep reason to one short sentence.\n\n"
+    "- Prefer images that feel like a reaction, not just a topical keyword match.\n"
+    "- Keep reason to one short sentence.\n\n"
+   (when-let [source-lines (seq (query-source-brief query-context))]
+     (str (str/join "\n" source-lines) "\n\n"))
    "User query:\n"
-   query
+   query-text
    "\n\nAnalyzed intent:\n"
    (json/write-str {:intent (:intent profile)
                     :desired_reaction_tags (:desired-reaction-tags profile)
@@ -613,7 +641,7 @@
    "\n\nCandidates:\n"
    (json/write-str (mapv candidate-summary candidates))))
 
-(defn- batch-select-prompt [query profile candidates]
+(defn- batch-select-prompt [{:keys [query-text profile] :as query-context} candidates]
   (str
    "You are choosing promising reaction image candidates for a conversation snippet.\n"
    "From the candidate metadata, return the ids that are most likely to work as a reaction image.\n"
@@ -624,8 +652,10 @@
    "- Prefer reaction fit over literal word overlap.\n"
    "- Short colloquial text like \"bro what\" should map to likely reaction intent.\n"
    "- Keep reason short.\n\n"
+   (when-let [source-lines (seq (query-source-brief query-context))]
+     (str (str/join "\n" source-lines) "\n\n"))
    "User query:\n"
-   query
+   query-text
    "\n\nAnalyzed intent:\n"
    (json/write-str {:intent (:intent profile)
                     :desired_reaction_tags (:desired-reaction-tags profile)
@@ -634,11 +664,12 @@
    "\n\nCandidates:\n"
    (json/write-str (mapv candidate-summary candidates))))
 
-(defn- rerank-candidates! [config query profile candidates]
+(defn- rerank-candidates! [config query-context candidates]
   (let [response (ollama/chat! (:host config)
                                (:rank-model config)
-                               (rerank-prompt query profile candidates)
-                               {:format "json"
+                               (rerank-prompt query-context candidates)
+                               {:images (query-model-images query-context)
+                                :format "json"
                                 :temperature 0.1})
         payload (parse-json-content (ollama/assistant-content response))
         allowed-ids (set (map :id candidates))
@@ -654,11 +685,12 @@
        :reason (or (non-blank (:reason payload)) "")
        :alternate-ids alternate-ids})))
 
-(defn- select-candidates-batch! [config query profile candidates]
+(defn- select-candidates-batch! [config query-context candidates]
   (let [response (ollama/chat! (:host config)
                                (:rank-model config)
-                               (batch-select-prompt query profile candidates)
-                               {:format "json"
+                               (batch-select-prompt query-context candidates)
+                               {:images (query-model-images query-context)
+                                :format "json"
                                 :temperature 0.1})
         payload (parse-json-content (ollama/assistant-content response))
         allowed-ids (set (map :id candidates))]
@@ -685,11 +717,11 @@
          (take candidate-count)
          vec)))
 
-(defn- model-shortlist [config query profile entries]
+(defn- model-shortlist [config query-context entries]
   (let [batches (partition-all model-fallback-batch-size entries)
         chosen-ids (reduce (fn [acc batch]
                              (let [picked (try
-                                            (select-candidates-batch! config query profile batch)
+                                            (select-candidates-batch! config query-context batch)
                                             (catch Exception _
                                               []))]
                                (into acc picked)))
@@ -826,7 +858,38 @@
    :tone []
    :keywords []})
 
-(defn- resolve-query-context [config query-request]
+(defn- profile-informative? [profile]
+  (or (seq (:desired-reaction-tags profile))
+      (seq (:keywords profile))
+      (seq (:tone profile))
+      (not (blankish? (:intent profile)))
+      (> (count (normalize-text (:query-text profile))) 8)))
+
+(defn- profile-from-image-entry [fallback-query entry]
+  {:query-text (or (non-blank (:caption entry))
+                   (non-blank (:visible-text entry))
+                   fallback-query)
+   :intent (or (non-blank (:notes entry))
+               (non-blank (:caption entry))
+               "")
+   :desired-reaction-tags (distinct-vec (lower-string-vec (:reaction-tags entry)))
+   :tone (distinct-vec (lower-string-vec (:emotions entry)))
+   :keywords (distinct-vec
+              (lower-string-vec
+               (concat (:scene-tags entry)
+                       (:people entry)
+                       (tokenize (:visible-text entry)))))})
+
+(defn- source-entry-by-path [entries image-path]
+  (some #(when (= image-path (:path %)) %) entries))
+
+(defn- describe-query-image-entry! [config image-path ocr-text]
+  (try
+    (describe-image! config (io/file image-path) ocr-text)
+    (catch Exception _
+      nil)))
+
+(defn- resolve-query-context [config query-request indexed-entries]
   (case (:type query-request)
     :image
     (let [image-path (:image-path query-request)
@@ -834,17 +897,26 @@
                      (or (ocr-image! image-path) "")
                      (catch Exception _
                        ""))
+          {:keys [prepared-source-image profile query-text]}
+          (analyze-image-query-with-fallback! config image-path ocr-text)
           fallback-query (or (non-blank ocr-text)
                              (.getName (io/file image-path))
                              "image query")
-          profile (try
-                    (analyze-image-query! config image-path ocr-text)
-                    (catch Exception _
-                      (empty-query-profile fallback-query)))]
+          semantic-entry (or (source-entry-by-path indexed-entries image-path)
+                             (describe-query-image-entry! config image-path ocr-text))
+          profile (if (profile-informative? profile)
+                    profile
+                    (or (when semantic-entry
+                          (profile-from-image-entry fallback-query semantic-entry))
+                        profile))
+          query-text (or (non-blank (:query-text profile))
+                         query-text
+                         fallback-query)]
       {:source-type :image
        :source-image-path image-path
+       :prepared-source-image prepared-source-image
        :source-ocr-text ocr-text
-       :query-text (:query-text profile)
+       :query-text query-text
        :profile profile})
 
     :text
@@ -857,20 +929,22 @@
        :query-text (:query-text profile)
        :profile profile})
 
-    (throw (ex-info "Unsupported query request."
-                    {:type :usage
-                     :exit-code 1
-                     :query-request query-request}))))
+      (throw (ex-info "Unsupported query request."
+                      {:type :usage
+                       :exit-code 1
+                       :query-request query-request}))))
 
 (defn- query-index [config query-input]
   (let [index (refresh-index! config)
+        entries (:entries index)
         query-request (if (string? query-input)
                         {:type :text
                          :query-text query-input}
                         query-input)
+        query-context
+        (resolve-query-context config query-request entries)
         {:keys [query-text profile source-type source-image-path source-ocr-text]}
-        (resolve-query-context config query-request)
-        entries (:entries index)]
+        query-context]
     (when (empty? entries)
       (throw (ex-info "Index file is empty or missing entries" {:index-file (:index-file config)})))
     (let [enhanced-query (build-query-search-text query-text profile)
@@ -881,7 +955,7 @@
                        lexical-candidates
                        (do
                          (log! config "No lexical shortlist matches found, using model metadata fallback...")
-                         (model-shortlist config query-text profile entries)))]
+                         (model-shortlist config (assoc query-context :query-text enhanced-query) entries)))]
       (when (empty? candidates)
         (throw (ex-info "No semantic shortlist matches found in the current index."
                         {:type :no-matches
@@ -889,7 +963,7 @@
                          :query-text query-text
                          :index-file (:index-file config)})))
       (let [rerank (try
-                     (rerank-candidates! config query-text profile candidates)
+                     (rerank-candidates! config (assoc query-context :query-text query-text) candidates)
                      (catch Exception _
                        nil))
             ranked (if rerank

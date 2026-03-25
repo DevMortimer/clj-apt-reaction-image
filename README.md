@@ -141,8 +141,11 @@ The current app shell supports:
 - image query input from clipboard paste
 - image query input from drag and drop
 - native result cards for ranked reaction images
+- native result actions for copy, reveal in Finder, and open
 - configurable backend root and dataset directory
 - subprocess calls into the Clojure backend over `--output json`
+
+For image queries, the backend now keeps the screenshot as visual context through ranking, and if direct image-query analysis is weak it falls back to semantic image metadata instead of OCR-only junk.
 
 Current tests cover:
 

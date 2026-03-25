@@ -197,7 +197,13 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Best Match")
                                 .font(.title2.weight(.semibold))
-                            ReactionCard(image: best, highlight: true)
+                            ReactionCard(
+                                image: best,
+                                highlight: true,
+                                onCopy: { model.copyImage(path: best.path) },
+                                onReveal: { model.revealImageInFinder(path: best.path) },
+                                onOpen: { model.openImage(path: best.path) }
+                            )
                         }
                     }
 
@@ -206,7 +212,13 @@ struct ContentView: View {
                             .font(.title3.weight(.semibold))
                         LazyVGrid(columns: grid, alignment: .leading, spacing: 18) {
                             ForEach(response.ranked) { image in
-                                ReactionCard(image: image, highlight: response.best?.id == image.id)
+                                ReactionCard(
+                                    image: image,
+                                    highlight: response.best?.id == image.id,
+                                    onCopy: { model.copyImage(path: image.path) },
+                                    onReveal: { model.revealImageInFinder(path: image.path) },
+                                    onOpen: { model.openImage(path: image.path) }
+                                )
                             }
                         }
                     }
@@ -279,6 +291,9 @@ private struct QueryContextCard: View {
 private struct ReactionCard: View {
     let image: RankedImage
     let highlight: Bool
+    let onCopy: () -> Void
+    let onReveal: () -> Void
+    let onOpen: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -308,6 +323,14 @@ private struct ReactionCard: View {
                     .foregroundStyle(.tertiary)
                     .textSelection(.enabled)
                     .lineLimit(2)
+
+                HStack(spacing: 10) {
+                    Button("Copy", action: onCopy)
+                    Button("Reveal", action: onReveal)
+                    Button("Open", action: onOpen)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
         }
         .padding(14)
@@ -450,6 +473,40 @@ final class ContentViewModel: ObservableObject {
             setSelectedImage(url: targetURL)
         } catch {
             errorMessage = "Could not save pasted image: \(error.localizedDescription)"
+        }
+    }
+
+    func copyImage(path: String) {
+        let url = URL(fileURLWithPath: path)
+        guard let image = NSImage(contentsOf: url) else {
+            errorMessage = "Could not read the image to copy it."
+            return
+        }
+
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if pasteboard.writeObjects([image, url as NSURL]) {
+            errorMessage = nil
+            statusMessage = "Copied image to the clipboard."
+        } else {
+            errorMessage = "Could not copy the image to the clipboard."
+        }
+    }
+
+    func revealImageInFinder(path: String) {
+        let url = URL(fileURLWithPath: path)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+        errorMessage = nil
+        statusMessage = "Revealed image in Finder."
+    }
+
+    func openImage(path: String) {
+        let url = URL(fileURLWithPath: path)
+        if NSWorkspace.shared.open(url) {
+            errorMessage = nil
+            statusMessage = "Opened image."
+        } else {
+            errorMessage = "Could not open the image."
         }
     }
 

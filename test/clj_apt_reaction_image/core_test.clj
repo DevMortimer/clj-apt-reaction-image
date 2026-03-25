@@ -226,7 +226,7 @@
                                 :tone ["casual"]
                                 :keywords ["unexpected"]})
        #'core/lexical-shortlist (fn [_ _ _] entries)
-       #'core/rerank-candidates! (fn [_ _ _ _]
+       #'core/rerank-candidates! (fn [_ _ _]
                                    {:best-id "a.jpg"
                                     :reason "Best fit for disbelief."
                                     :alternate-ids ["b.jpg"]})}
@@ -268,16 +268,20 @@
     (with-redefs-fn
       {#'core/refresh-index! (fn [_] {:entries entries})
        #'core/ocr-image! (fn [_] "bro what is this")
-       #'core/analyze-image-query! (fn [_ path ocr]
-                                     (is (= image-path path))
-                                     (is (= "bro what is this" ocr))
-                                     {:query-text "someone said something insane"
-                                      :intent "annoyed disbelief"
-                                      :desired-reaction-tags ["angry" "disbelief"]
-                                      :tone ["casual"]
-                                      :keywords ["insane"]})
-       #'core/rerank-candidates! (fn [_ query _ candidates]
-                                   (is (= "someone said something insane" query))
+       #'core/analyze-image-query-with-fallback! (fn [_ path ocr]
+                                                   (is (= image-path path))
+                                                   (is (= "bro what is this" ocr))
+                                                   {:prepared-source-image "/tmp/prepared-chat.jpg"
+                                                    :query-text "someone said something insane"
+                                                    :profile {:query-text "someone said something insane"
+                                                              :intent "annoyed disbelief"
+                                                              :desired-reaction-tags ["angry" "disbelief"]
+                                                              :tone ["casual"]
+                                                              :keywords ["insane"]}})
+       #'core/rerank-candidates! (fn [_ query-context candidates]
+                                   (is (= "someone said something insane" (:query-text query-context)))
+                                   (is (= "/tmp/prepared-chat.jpg" (:prepared-source-image query-context)))
+                                   (is (= :image (:source-type query-context)))
                                    (is (= ["a.jpg"] (mapv :id candidates)))
                                    {:best-id "a.jpg"
                                     :reason "Fits annoyed disbelief."
@@ -295,6 +299,57 @@
       (is (= "someone said something insane" (:query-text result)))
       (is (= ["angry" "disbelief"] (get-in result [:profile :desired-reaction-tags])))
       (is (= "a.jpg" (get-in result [:best :id]))))))
+
+(deftest image-query-falls-back-to-semantic-entry-when-analysis-is-weak
+  (let [entry-a {:id "chat.png"
+                 :path "/tmp/chat.png"
+                 :caption "side eye woman"
+                 :reaction-tags ["judging" "annoyed"]
+                 :scene-tags ["person" "reaction"]
+                 :people ["woman"]
+                 :emotions ["annoyed"]
+                 :notes "good for terrible opinions"
+                 :visible-text ""
+                 :ocr-text ""
+                 :search-text (#'core/build-search-text {:caption "side eye woman"
+                                                         :reaction-tags ["judging" "annoyed"]
+                                                         :scene-tags ["person" "reaction"]
+                                                         :people ["woman"]
+                                                         :emotions ["annoyed"]
+                                                         :notes "good for terrible opinions"
+                                                         :visible-text ""
+                                                         :ocr-text ""})}
+        entry-a (assoc entry-a :token-freq (#'core/token-frequencies (:search-text entry-a)))
+        result* (atom nil)]
+    (with-redefs-fn
+      {#'core/refresh-index! (fn [_] {:entries [entry-a]})
+       #'core/ocr-image! (fn [_] "eo")
+       #'core/analyze-image-query-with-fallback! (fn [_ _ _]
+                                                   {:prepared-source-image "/tmp/prepared-chat.jpg"
+                                                    :query-text "eo"
+                                                    :profile {:query-text "eo"
+                                                              :intent ""
+                                                              :desired-reaction-tags []
+                                                              :tone []
+                                                              :keywords []}})
+       #'core/rerank-candidates! (fn [_ query-context candidates]
+                                   (is (= "side eye woman" (:query-text query-context)))
+                                   (is (= ["judging" "annoyed"] (get-in query-context [:profile :desired-reaction-tags])))
+                                   (is (= ["chat.png"] (mapv :id candidates)))
+                                   {:best-id "chat.png"
+                                    :reason "Fits the judgmental vibe."
+                                    :alternate-ids []})}
+      (fn []
+        (reset! result* (#'core/query-index {:index-file "index.edn"
+                                             :top-n 3
+                                             :candidate-count 5}
+                                            {:type :image
+                                             :image-path "/tmp/chat.png"}))))
+    (let [result @result*]
+      (is (= "side eye woman" (:query-text result)))
+      (is (= "good for terrible opinions" (get-in result [:profile :intent])))
+      (is (= ["judging" "annoyed"] (get-in result [:profile :desired-reaction-tags])))
+      (is (= "chat.png" (get-in result [:best :id]))))))
 
 (deftest query-result-response-uses-json-friendly-keys
   (let [ranked [{:id "a.jpg"
