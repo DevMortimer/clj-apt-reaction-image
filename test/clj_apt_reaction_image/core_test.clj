@@ -148,6 +148,16 @@
     (is (str/includes? search-text "speechless"))
     (is (str/includes? search-text "unexpected"))))
 
+(deftest query-profile-dedupes-tags
+  (let [profile (#'core/normalize-query-profile
+                 "bro what"
+                 {:desired_reaction_tags ["confused" "confused" "amused"]
+                  :tone ["casual" "casual"]
+                  :keywords ["what" "what"]})]
+    (is (= ["confused" "amused"] (:desired-reaction-tags profile)))
+    (is (= ["casual"] (:tone profile)))
+    (is (= ["what"] (:keywords profile)))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

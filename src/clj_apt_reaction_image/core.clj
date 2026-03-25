@@ -14,6 +14,7 @@
 (def ^:private default-candidate-count 24)
 (def ^:private default-vision-max-side 512)
 (def ^:private default-checkpoint-every 10)
+(def ^:private model-fallback-batch-size 40)
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
 (def ^:private cache-dir
@@ -175,6 +176,9 @@
 
 (defn- lower-string-vec [xs]
   (mapv str/lower-case (as-string-vec xs)))
+
+(defn- distinct-vec [xs]
+  (vec (distinct xs)))
 
 (defn- clip-text [s max-len]
   (let [s (normalize-text s)]
@@ -495,9 +499,9 @@
 (defn- normalize-query-profile [query payload]
   {:query-text (or (non-blank (:query_text payload)) query)
    :intent (or (non-blank (:intent payload)) "")
-   :desired-reaction-tags (lower-string-vec (:desired_reaction_tags payload))
-   :tone (lower-string-vec (:tone payload))
-   :keywords (lower-string-vec (:keywords payload))})
+   :desired-reaction-tags (distinct-vec (lower-string-vec (:desired_reaction_tags payload)))
+   :tone (distinct-vec (lower-string-vec (:tone payload)))
+   :keywords (distinct-vec (lower-string-vec (:keywords payload)))})
 
 (defn- analyze-query! [config query]
   (let [response (ollama/chat! (:host config)
@@ -540,6 +544,27 @@
    "\n\nCandidates:\n"
    (json/write-str (mapv candidate-summary candidates))))
 
+(defn- batch-select-prompt [query profile candidates]
+  (str
+   "You are choosing promising reaction image candidates for a conversation snippet.\n"
+   "From the candidate metadata, return the ids that are most likely to work as a reaction image.\n"
+   "Return JSON only in this shape: "
+   "{\"selected_ids\":[\"string\"],\"reason\":\"string\"}\n"
+   "Rules:\n"
+   "- selected_ids must contain 1 to 5 ids from the provided candidate list.\n"
+   "- Prefer reaction fit over literal word overlap.\n"
+   "- Short colloquial text like \"bro what\" should map to likely reaction intent.\n"
+   "- Keep reason short.\n\n"
+   "User query:\n"
+   query
+   "\n\nAnalyzed intent:\n"
+   (json/write-str {:intent (:intent profile)
+                    :desired_reaction_tags (:desired-reaction-tags profile)
+                    :tone (:tone profile)
+                    :keywords (:keywords profile)})
+   "\n\nCandidates:\n"
+   (json/write-str (mapv candidate-summary candidates))))
+
 (defn- rerank-candidates! [config query profile candidates]
   (let [response (ollama/chat! (:host config)
                                (:rank-model config)
@@ -560,6 +585,19 @@
        :reason (or (non-blank (:reason payload)) "")
        :alternate-ids alternate-ids})))
 
+(defn- select-candidates-batch! [config query profile candidates]
+  (let [response (ollama/chat! (:host config)
+                               (:rank-model config)
+                               (batch-select-prompt query profile candidates)
+                               {:format "json"
+                                :temperature 0.1})
+        payload (parse-json-content (ollama/assistant-content response))
+        allowed-ids (set (map :id candidates))]
+    (->> (:selected_ids payload)
+         as-string-vec
+         (filter allowed-ids)
+         distinct-vec)))
+
 (defn- snippet-for [entry]
   (or (non-blank (:caption entry))
       (non-blank (:notes entry))
@@ -576,6 +614,22 @@
          (filter #(pos? (:score %)))
          (sort-by (juxt (comp - :score) :id))
          (take candidate-count)
+         vec)))
+
+(defn- model-shortlist [config query profile entries]
+  (let [batches (partition-all model-fallback-batch-size entries)
+        chosen-ids (reduce (fn [acc batch]
+                             (let [picked (try
+                                            (select-candidates-batch! config query profile batch)
+                                            (catch Exception _
+                                              []))]
+                               (into acc picked)))
+                           []
+                           batches)
+        by-id (into {} (map (juxt :id identity) entries))]
+    (->> chosen-ids
+         distinct
+         (keep by-id)
          vec)))
 
 (defn- reorder-with-rerank [candidates {:keys [best-id alternate-ids]}]
@@ -631,7 +685,12 @@
           enhanced-query (build-query-search-text query-text profile)
           _ (when (seq (:desired-reaction-tags profile))
               (println (str "query tags: " (str/join ", " (:desired-reaction-tags profile)))))
-          candidates (lexical-shortlist entries enhanced-query (:candidate-count config))]
+          lexical-candidates (lexical-shortlist entries enhanced-query (:candidate-count config))
+          candidates (if (seq lexical-candidates)
+                       lexical-candidates
+                       (do
+                         (println "No lexical shortlist matches found, using model metadata fallback...")
+                         (model-shortlist config query-text profile entries)))]
       (when (empty? candidates)
         (println "No semantic shortlist matches found in the current index.")
         (System/exit 2))
