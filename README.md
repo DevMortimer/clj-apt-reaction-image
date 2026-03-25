@@ -26,7 +26,8 @@ Defaults:
 
 - vision model: `qwen2.5vl:3b`
 - rank model: same as the vision model unless overridden
-- vision max side: `1024`
+- vision max side: `512`
+- checkpoint every: `10` changed images
 - host: `OLLAMA_HOST` or `http://localhost:11434`
 
 ## Indexed Shape
@@ -53,6 +54,7 @@ Each image is stored with metadata similar to:
 - The first build is slow because it creates the semantic index.
 - Before each semantic call, the app resizes the image for vision inference instead of sending the full original file.
 - The index is stored at `.maymay-reactor/index.edn`.
+- The index is checkpointed during long runs so partial progress is written to disk.
 - On later runs, the app checks the indexed `images-dir` automatically.
 - Only new files or files whose size / modification time changed are reprocessed.
 - Removed files disappear from the refreshed index.
@@ -79,7 +81,9 @@ Override models:
 clojure -M:run index \
   --images-dir "/path/to/images" \
   --vision-model "qwen2.5vl:3b" \
-  --rank-model "qwen2.5vl:3b"
+  --rank-model "qwen2.5vl:3b" \
+  --vision-max-side "512" \
+  --checkpoint-every "10"
 ```
 
 ## Tests

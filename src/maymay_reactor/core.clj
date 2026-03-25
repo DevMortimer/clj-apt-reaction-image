@@ -8,10 +8,12 @@
    [clojure.string :as str]
    [maymay-reactor.ollama :as ollama]))
 
-(def ^:private index-version 2)
+(def ^:private index-version 3)
+(def ^:private semantic-revision 2)
 (def ^:private default-vision-model "qwen2.5vl:3b")
 (def ^:private default-candidate-count 24)
-(def ^:private default-vision-max-side 1024)
+(def ^:private default-vision-max-side 512)
+(def ^:private default-checkpoint-every 10)
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
 (def ^:private cache-dir
@@ -38,6 +40,7 @@
     (str "  vision model: " default-vision-model)
     "  rank model: defaults to the vision model"
     (str "  vision max side: " default-vision-max-side " px")
+    (str "  checkpoint every: " default-checkpoint-every " changed images")
     "  host: OLLAMA_HOST or http://localhost:11434"
     ""
     "Examples:"
@@ -147,7 +150,9 @@
      :candidate-count (Long/parseLong (or (:candidate-count opts) (str default-candidate-count)))
      :vision-max-side (Long/parseLong (or (:vision-max-side opts)
                                           (System/getenv "MAYMAY_VISION_MAX_SIDE")
-                                          (str default-vision-max-side)))}))
+                                          (str default-vision-max-side)))
+     :checkpoint-every (Long/parseLong (or (:checkpoint-every opts)
+                                           (str default-checkpoint-every)))}))
 
 (defn- load-index [index-file]
   (or (read-edn-file index-file)
@@ -190,26 +195,26 @@
 
 (defn- image-index-prompt [id ocr-text]
   (str
-   "You are building a retrieval index for a personal folder of reaction images.\n"
-   "Analyze the attached image and respond with JSON only.\n"
+   "You are indexing one reaction image for retrieval.\n"
+   "Return JSON only.\n"
    "Return exactly these keys: "
    "{\"id\":\"string\",\"caption\":\"string\",\"reaction_tags\":[\"string\"],"
    "\"scene_tags\":[\"string\"],\"visible_text\":\"string\",\"people\":[\"string\"],"
    "\"emotions\":[\"string\"],\"notes\":\"string\"}\n"
    "Rules:\n"
    "- id must be exactly \"" id "\".\n"
-   "- caption must be one short sentence.\n"
-   "- reaction_tags are short lowercase tags about how the image feels as a reaction.\n"
-   "- scene_tags are short lowercase tags about what is visually present.\n"
-   "- visible_text should contain legible text from the image, or an empty string.\n"
-   "- people should be short descriptions like \"woman\", \"anime character\", \"two men\", or empty.\n"
-   "- emotions should be short lowercase words like \"shocked\" or \"smug\".\n"
-   "- notes should say when this image works as a reply in one sentence.\n"
+   "- caption: max 12 words.\n"
+   "- reaction_tags: max 4 short lowercase tags.\n"
+   "- scene_tags: max 4 short lowercase tags.\n"
+   "- visible_text: short important text only, max 160 chars, or empty.\n"
+   "- people: max 3 short lowercase descriptions.\n"
+   "- emotions: max 3 short lowercase words.\n"
+   "- notes: one short usage hint, max 12 words.\n"
    "- Do not include markdown fences.\n"
    (if (str/blank? ocr-text)
      ""
      (str "OCR hint from a separate tool, use only as a hint if it matches the image:\n"
-          ocr-text
+          (clip-text ocr-text 280)
           "\n"))))
 
 (defn- vision-cache-dir []
@@ -232,7 +237,7 @@
       (do
         (command! "sips"
                   "-s" "format" "jpeg"
-                  "-s" "formatOptions" "80"
+                  "-s" "formatOptions" "70"
                   "-Z" (str (:vision-max-side config))
                   source
                   "--out" target)
@@ -251,7 +256,9 @@
      :people (lower-string-vec (:people payload))
      :emotions (lower-string-vec (:emotions payload))
      :notes (or (non-blank (:notes payload)) "")
-     :semantic-model (:vision-model config)}))
+     :semantic-model (:vision-model config)
+     :semantic-revision semantic-revision
+     :vision-max-side (:vision-max-side config)}))
 
 (defn- describe-image! [config ^java.io.File image-file ocr-text]
   (let [prepared-image (prepare-vision-image! config image-file)
@@ -278,6 +285,9 @@
             (or visible-text "")
             (or ocr-text "")])))
 
+(defn- now-ms []
+  (System/currentTimeMillis))
+
 (defn- build-entry [config ^java.io.File image-file progress-label]
   (let [path (.getAbsolutePath image-file)
         base-entry {:id (.getName image-file)
@@ -285,12 +295,16 @@
                     :size (.length image-file)
                     :last-modified (.lastModified image-file)}]
     (println (str progress-label " OCR"))
-    (let [ocr-result (try
+    (let [total-start (now-ms)
+          ocr-start total-start
+          ocr-result (try
                        {:ocr-text (or (ocr-image! path) "")}
                        (catch Exception ex
                          {:ocr-text ""
                           :ocr-error (.getMessage ex)}))
+          ocr-ms (- (now-ms) ocr-start)
           _ (println (str progress-label " semantic"))
+          semantic-start (now-ms)
           semantic-result (try
                             (describe-image! config image-file (:ocr-text ocr-result))
                             (catch Exception ex
@@ -303,9 +317,19 @@
                                :notes ""
                                :semantic-model (:vision-model config)
                                :semantic-error (.getMessage ex)}))
-          entry (merge base-entry ocr-result semantic-result)
+          semantic-ms (- (now-ms) semantic-start)
+          entry (merge base-entry
+                       ocr-result
+                       semantic-result
+                       {:semantic-model (:vision-model config)
+                        :semantic-revision semantic-revision
+                        :vision-max-side (:vision-max-side config)})
           search-text (build-search-text entry)]
-      (println (str progress-label " done"))
+      (println (format "%s done (ocr=%dms semantic=%dms total=%dms)"
+                       progress-label
+                       ocr-ms
+                       semantic-ms
+                       (- (now-ms) total-start)))
       (assoc entry
              :search-text search-text
              :token-freq (token-frequencies search-text)))))
@@ -315,6 +339,8 @@
        (= (:size old-entry) (.length image-file))
        (= (:last-modified old-entry) (.lastModified image-file))
        (= (:semantic-model old-entry) (:vision-model config))
+       (= (:vision-max-side old-entry) (:vision-max-side config))
+       (= (:semantic-revision old-entry) semantic-revision)
        (contains? old-entry :caption)
        (contains? old-entry :token-freq)))
 
@@ -324,6 +350,17 @@
              "building index..."))
   (println (format "total=%d new=%d changed=%d removed=%d"
                    total new-count changed-count removed-count)))
+
+(defn- make-index-data [config images-dir entries complete?]
+  {:version index-version
+   :complete? complete?
+   :images-dir images-dir
+   :vision-model (:vision-model config)
+   :rank-model (:rank-model config)
+   :vision-max-side (:vision-max-side config)
+   :semantic-revision semantic-revision
+   :entry-count (count entries)
+   :entries entries})
 
 (defn- build-index! [config]
   (ensure-prerequisites!)
@@ -350,7 +387,9 @@
                          images)
           new-count (count (filter #(= :new (:status %)) statuses))
           changed-count (count (filter #(= :changed (:status %)) statuses))
-          process-total (+ new-count changed-count)]
+          process-total (+ new-count changed-count)
+          checkpoint-every (max 1 (long (or (:checkpoint-every config)
+                                            default-checkpoint-every)))]
       (summarize-refresh existing total new-count changed-count removed-count)
       (if (and (zero? process-total)
                (zero? removed-count)
@@ -361,24 +400,31 @@
         (do
           (println "index is up to date.")
           existing)
-        (let [processed (atom 0)
-              entries (mapv (fn [{:keys [^java.io.File file old-entry status]}]
-                              (case status
-                                :reused old-entry
-                                (let [current (swap! processed inc)
-                                      label (format "[%d/%d] %s ->" current process-total (.getName file))
-                                      entry (build-entry config file label)]
-                                  entry)))
-                            statuses)
-              index-data {:version index-version
-                          :images-dir images-dir
-                          :vision-model (:vision-model config)
-                          :rank-model (:rank-model config)
-                          :entry-count (count entries)
-                          :entries entries}]
-          (write-edn-file! index-file index-data)
-          (println "saved index to" index-file)
-          index-data)))))
+        (loop [remaining statuses
+               entries []
+               changed-processed 0]
+          (if-let [{:keys [^java.io.File file old-entry status]} (first remaining)]
+            (let [[entry changed-processed']
+                  (case status
+                    :reused [old-entry changed-processed]
+                    (let [current (inc changed-processed)
+                          label (format "[%d/%d] %s ->" current process-total (.getName file))
+                          entry (build-entry config file label)]
+                      [entry current]))
+                  entries' (conj entries entry)]
+              (when (and (pos? changed-processed')
+                         (or (= changed-processed' process-total)
+                             (zero? (mod changed-processed' checkpoint-every))))
+                (write-edn-file! index-file (make-index-data config images-dir entries' false))
+                (println (format "checkpoint saved (%d/%d changed, %d entries)"
+                                 changed-processed'
+                                 process-total
+                                 (count entries'))))
+              (recur (next remaining) entries' changed-processed'))
+            (let [index-data (make-index-data config images-dir entries true)]
+              (write-edn-file! index-file index-data)
+              (println "saved index to" index-file)
+              index-data)))))))
 
 (defn- document-frequencies [entries]
   (reduce (fn [acc {:keys [token-freq]}]
