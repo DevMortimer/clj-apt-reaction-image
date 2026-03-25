@@ -23,9 +23,9 @@
 (defn chat!
   [host model prompt {:keys [images format keep-alive temperature timeout-seconds]
                       :or {images []
-                           keep-alive "5m"
+                           keep-alive "30m"
                            temperature 0.2
-                           timeout-seconds 180}}]
+                           timeout-seconds 600}}]
   (let [body (cond-> {:model model
                       :stream false
                       :keep_alive keep-alive

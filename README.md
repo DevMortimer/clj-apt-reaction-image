@@ -26,6 +26,7 @@ Defaults:
 
 - vision model: `qwen2.5vl:3b`
 - rank model: same as the vision model unless overridden
+- vision max side: `1024`
 - host: `OLLAMA_HOST` or `http://localhost:11434`
 
 ## Indexed Shape
@@ -50,11 +51,13 @@ Each image is stored with metadata similar to:
 ## Behavior
 
 - The first build is slow because it creates the semantic index.
+- Before each semantic call, the app resizes the image for vision inference instead of sending the full original file.
 - The index is stored at `.maymay-reactor/index.edn`.
 - On later runs, the app checks the indexed `images-dir` automatically.
 - Only new files or files whose size / modification time changed are reprocessed.
 - Removed files disappear from the refreshed index.
 - OCR is still stored, but it is now only one signal among several.
+- Ollama requests keep the model warm for longer so large indexing runs do not repeatedly cold-start.
 
 ## Usage
 

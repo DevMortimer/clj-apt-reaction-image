@@ -11,6 +11,7 @@
 (def ^:private index-version 2)
 (def ^:private default-vision-model "qwen2.5vl:3b")
 (def ^:private default-candidate-count 24)
+(def ^:private default-vision-max-side 1024)
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
 (def ^:private cache-dir
@@ -36,6 +37,7 @@
     "Defaults:"
     (str "  vision model: " default-vision-model)
     "  rank model: defaults to the vision model"
+    (str "  vision max side: " default-vision-max-side " px")
     "  host: OLLAMA_HOST or http://localhost:11434"
     ""
     "Examples:"
@@ -142,7 +144,10 @@
                      (System/getenv "MAYMAY_RANK_MODEL")
                      vision-model)
      :top-n (Long/parseLong (or (:top opts) "5"))
-     :candidate-count (Long/parseLong (or (:candidate-count opts) (str default-candidate-count)))}))
+     :candidate-count (Long/parseLong (or (:candidate-count opts) (str default-candidate-count)))
+     :vision-max-side (Long/parseLong (or (:vision-max-side opts)
+                                          (System/getenv "MAYMAY_VISION_MAX_SIDE")
+                                          (str default-vision-max-side)))}))
 
 (defn- load-index [index-file]
   (or (read-edn-file index-file)
@@ -207,6 +212,32 @@
           ocr-text
           "\n"))))
 
+(defn- vision-cache-dir []
+  (ensure-dir! (io/file cache-dir "vision-cache")))
+
+(defn- vision-cache-path [config ^java.io.File image-file]
+  (let [base-name (str (.getName image-file)
+                       "--" (.lastModified image-file)
+                       "--" (.length image-file)
+                       "--" (:vision-max-side config)
+                       ".jpg")]
+    (.getAbsolutePath (io/file (vision-cache-dir) base-name))))
+
+(defn- prepare-vision-image! [config ^java.io.File image-file]
+  (let [source (.getAbsolutePath image-file)
+        target (vision-cache-path config image-file)
+        target-file (io/file target)]
+    (if (.exists target-file)
+      target
+      (do
+        (command! "sips"
+                  "-s" "format" "jpeg"
+                  "-s" "formatOptions" "80"
+                  "-Z" (str (:vision-max-side config))
+                  source
+                  "--out" target)
+        target))))
+
 (defn- normalize-semantic-payload [image-file payload ocr-text config]
   (let [id (.getName ^java.io.File image-file)
         visible-text (or (non-blank (:visible_text payload))
@@ -223,11 +254,12 @@
      :semantic-model (:vision-model config)}))
 
 (defn- describe-image! [config ^java.io.File image-file ocr-text]
-  (let [prompt (image-index-prompt (.getName image-file) ocr-text)
+  (let [prepared-image (prepare-vision-image! config image-file)
+        prompt (image-index-prompt (.getName image-file) ocr-text)
         response (ollama/chat! (:host config)
                                (:vision-model config)
                                prompt
-                               {:images [(.getAbsolutePath image-file)]
+                               {:images [prepared-image]
                                 :format "json"})
         payload (parse-json-content (ollama/assistant-content response))]
     (normalize-semantic-payload image-file payload ocr-text config)))
@@ -246,17 +278,19 @@
             (or visible-text "")
             (or ocr-text "")])))
 
-(defn- build-entry [config ^java.io.File image-file]
+(defn- build-entry [config ^java.io.File image-file progress-label]
   (let [path (.getAbsolutePath image-file)
         base-entry {:id (.getName image-file)
                     :path path
                     :size (.length image-file)
                     :last-modified (.lastModified image-file)}]
+    (println (str progress-label " OCR"))
     (let [ocr-result (try
                        {:ocr-text (or (ocr-image! path) "")}
                        (catch Exception ex
                          {:ocr-text ""
                           :ocr-error (.getMessage ex)}))
+          _ (println (str progress-label " semantic"))
           semantic-result (try
                             (describe-image! config image-file (:ocr-text ocr-result))
                             (catch Exception ex
@@ -271,6 +305,7 @@
                                :semantic-error (.getMessage ex)}))
           entry (merge base-entry ocr-result semantic-result)
           search-text (build-search-text entry)]
+      (println (str progress-label " done"))
       (assoc entry
              :search-text search-text
              :token-freq (token-frequencies search-text)))))
@@ -289,12 +324,6 @@
              "building index..."))
   (println (format "total=%d new=%d changed=%d removed=%d"
                    total new-count changed-count removed-count)))
-
-(defn- maybe-progress! [processed total]
-  (when (or (= processed total)
-            (= processed 1)
-            (zero? (mod processed 25)))
-    (println (format "processed %d/%d changed images" processed total))))
 
 (defn- build-index! [config]
   (ensure-prerequisites!)
@@ -336,9 +365,9 @@
               entries (mapv (fn [{:keys [^java.io.File file old-entry status]}]
                               (case status
                                 :reused old-entry
-                                (let [entry (build-entry config file)]
-                                  (swap! processed inc)
-                                  (maybe-progress! @processed process-total)
+                                (let [current (swap! processed inc)
+                                      label (format "[%d/%d] %s ->" current process-total (.getName file))
+                                      entry (build-entry config file label)]
                                   entry)))
                             statuses)
               index-data {:version index-version
