@@ -1,23 +1,24 @@
 (ns maymay-reactor.core
   (:gen-class)
   (:require
+   [clojure.data.json :as json]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.java.shell :as sh]
-   [clojure.string :as str]))
+   [clojure.string :as str]
+   [maymay-reactor.ollama :as ollama]))
 
+(def ^:private index-version 2)
+(def ^:private default-vision-model "qwen2.5vl:3b")
+(def ^:private default-candidate-count 24)
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
-
 (def ^:private cache-dir
   (io/file project-dir ".maymay-reactor"))
-
 (def ^:private default-index-file
   (io/file cache-dir "index.edn"))
-
 (def ^:private supported-extensions
   #{"png" "jpg" "jpeg" "gif" "webp" "heic" "heif" "bmp" "tif" "tiff"})
-
 (def ^:private stop-words
   #{"a" "an" "and" "are" "as" "at" "be" "but" "by" "for" "from" "i" "if" "in"
     "is" "it" "its" "me" "my" "of" "on" "or" "our" "so" "that" "the" "their"
@@ -29,12 +30,17 @@
    ["maymay-reactor"
     ""
     "Commands:"
-    "  index --images-dir PATH [--index-file PATH]"
-    "  query --text \"message here\" [--index-file PATH] [--top N]"
+    "  index --images-dir PATH [--index-file PATH] [--vision-model MODEL] [--rank-model MODEL]"
+    "  query --text \"message here\" [--images-dir PATH] [--index-file PATH] [--top N]"
+    ""
+    "Defaults:"
+    (str "  vision model: " default-vision-model)
+    "  rank model: defaults to the vision model"
+    "  host: OLLAMA_HOST or http://localhost:11434"
     ""
     "Examples:"
     "  clojure -M:run index --images-dir \"/path/to/images\""
-    "  clojure -M:run query --text \"when they leave me on read\""]))
+    "  clojure -M:run query --text \"bro what\" --images-dir \"/path/to/images\""]))
 
 (defn- ensure-dir! [^java.io.File dir]
   (.mkdirs dir)
@@ -42,8 +48,13 @@
 
 (defn- normalize-text [s]
   (-> (or s "")
+      str
       (str/replace #"\s+" " ")
       str/trim))
+
+(defn- non-blank [s]
+  (let [s (normalize-text s)]
+    (when-not (str/blank? s) s)))
 
 (defn- extension-of [^java.io.File file]
   (some-> (.getName file)
@@ -62,7 +73,7 @@
        vec))
 
 (defn- tokenize [s]
-  (->> (re-seq #"[[:alnum:]]+" (str/lower-case (or s "")))
+  (->> (re-seq #"[A-Za-z0-9]+" (str/lower-case (or s "")))
        (map #(str/replace % #"^'+|'+$" ""))
        (remove #(or (< (count %) 2)
                     (contains? stop-words %)))
@@ -116,64 +127,229 @@
         (recur (next args) (update parsed :positionals conj arg)))
       parsed)))
 
+(defn- canonical-path [path]
+  (.getAbsolutePath (.getCanonicalFile (io/file path))))
+
+(defn- default-config [opts]
+  (let [vision-model (or (:vision-model opts)
+                         (System/getenv "MAYMAY_VISION_MODEL")
+                         default-vision-model)]
+    {:images-dir (some-> (:images-dir opts) canonical-path)
+     :index-file (canonical-path (or (:index-file opts) (.getAbsolutePath default-index-file)))
+     :host (ollama/default-host)
+     :vision-model vision-model
+     :rank-model (or (:rank-model opts)
+                     (System/getenv "MAYMAY_RANK_MODEL")
+                     vision-model)
+     :top-n (Long/parseLong (or (:top opts) "5"))
+     :candidate-count (Long/parseLong (or (:candidate-count opts) (str default-candidate-count)))}))
+
 (defn- load-index [index-file]
   (or (read-edn-file index-file)
-      {:version 1
+      {:version index-version
        :entries []}))
 
 (defn- previous-entry-by-path [entries]
   (into {} (map (juxt :path identity) entries)))
 
-(defn- build-entry [^java.io.File image-file]
+(defn- as-string-vec [xs]
+  (->> (cond
+         (sequential? xs) xs
+         (string? xs) (str/split xs #",")
+         :else [])
+       (map #(-> %
+                 str
+                 normalize-text))
+       (remove str/blank?)
+       vec))
+
+(defn- lower-string-vec [xs]
+  (mapv str/lower-case (as-string-vec xs)))
+
+(defn- clip-text [s max-len]
+  (let [s (normalize-text s)]
+    (if (> (count s) max-len)
+      (str (subs s 0 (- max-len 3)) "...")
+      s)))
+
+(defn- extract-json-object [s]
+  (let [s (normalize-text s)
+        start (.indexOf s "{")
+        end (.lastIndexOf s "}")]
+    (when (and (<= 0 start) (< start end))
+      (subs s start (inc end)))))
+
+(defn- parse-json-content [content]
+  (let [candidate (or (extract-json-object content) content)]
+    (json/read-str candidate :key-fn keyword)))
+
+(defn- image-index-prompt [id ocr-text]
+  (str
+   "You are building a retrieval index for a personal folder of reaction images.\n"
+   "Analyze the attached image and respond with JSON only.\n"
+   "Return exactly these keys: "
+   "{\"id\":\"string\",\"caption\":\"string\",\"reaction_tags\":[\"string\"],"
+   "\"scene_tags\":[\"string\"],\"visible_text\":\"string\",\"people\":[\"string\"],"
+   "\"emotions\":[\"string\"],\"notes\":\"string\"}\n"
+   "Rules:\n"
+   "- id must be exactly \"" id "\".\n"
+   "- caption must be one short sentence.\n"
+   "- reaction_tags are short lowercase tags about how the image feels as a reaction.\n"
+   "- scene_tags are short lowercase tags about what is visually present.\n"
+   "- visible_text should contain legible text from the image, or an empty string.\n"
+   "- people should be short descriptions like \"woman\", \"anime character\", \"two men\", or empty.\n"
+   "- emotions should be short lowercase words like \"shocked\" or \"smug\".\n"
+   "- notes should say when this image works as a reply in one sentence.\n"
+   "- Do not include markdown fences.\n"
+   (if (str/blank? ocr-text)
+     ""
+     (str "OCR hint from a separate tool, use only as a hint if it matches the image:\n"
+          ocr-text
+          "\n"))))
+
+(defn- normalize-semantic-payload [image-file payload ocr-text config]
+  (let [id (.getName ^java.io.File image-file)
+        visible-text (or (non-blank (:visible_text payload))
+                         (non-blank ocr-text)
+                         "")]
+     {:id id
+     :caption (or (non-blank (:caption payload)) "")
+     :reaction-tags (lower-string-vec (:reaction_tags payload))
+     :scene-tags (lower-string-vec (:scene_tags payload))
+     :visible-text visible-text
+     :people (lower-string-vec (:people payload))
+     :emotions (lower-string-vec (:emotions payload))
+     :notes (or (non-blank (:notes payload)) "")
+     :semantic-model (:vision-model config)}))
+
+(defn- describe-image! [config ^java.io.File image-file ocr-text]
+  (let [prompt (image-index-prompt (.getName image-file) ocr-text)
+        response (ollama/chat! (:host config)
+                               (:vision-model config)
+                               prompt
+                               {:images [(.getAbsolutePath image-file)]
+                                :format "json"})
+        payload (parse-json-content (ollama/assistant-content response))]
+    (normalize-semantic-payload image-file payload ocr-text config)))
+
+(defn- build-search-text [{:keys [caption reaction-tags scene-tags visible-text people emotions notes ocr-text]}]
+  (str/join
+   " "
+   (remove str/blank?
+           [(or caption "")
+            (str/join " " reaction-tags)
+            (str/join " " reaction-tags)
+            (str/join " " scene-tags)
+            (str/join " " emotions)
+            (str/join " " people)
+            (or notes "")
+            (or visible-text "")
+            (or ocr-text "")])))
+
+(defn- build-entry [config ^java.io.File image-file]
   (let [path (.getAbsolutePath image-file)
-        base-entry {:path path
+        base-entry {:id (.getName image-file)
+                    :path path
                     :size (.length image-file)
                     :last-modified (.lastModified image-file)}]
-    (try
-      (let [ocr-text (ocr-image! path)]
-        (assoc base-entry
-               :ocr-text ocr-text
-               :token-freq (token-frequencies ocr-text)))
-      (catch Exception ex
-        (binding [*out* *err*]
-          (println "Skipping OCR for" path)
-          (println " " (.getMessage ex)))
-        (assoc base-entry
-               :ocr-text ""
-               :token-freq {}
-               :ocr-error (.getMessage ex))))))
+    (let [ocr-result (try
+                       {:ocr-text (or (ocr-image! path) "")}
+                       (catch Exception ex
+                         {:ocr-text ""
+                          :ocr-error (.getMessage ex)}))
+          semantic-result (try
+                            (describe-image! config image-file (:ocr-text ocr-result))
+                            (catch Exception ex
+                              {:caption ""
+                               :reaction-tags []
+                               :scene-tags []
+                               :visible-text (or (non-blank (:ocr-text ocr-result)) "")
+                               :people []
+                               :emotions []
+                               :notes ""
+                               :semantic-model (:vision-model config)
+                               :semantic-error (.getMessage ex)}))
+          entry (merge base-entry ocr-result semantic-result)
+          search-text (build-search-text entry)]
+      (assoc entry
+             :search-text search-text
+             :token-freq (token-frequencies search-text)))))
 
-(defn- reusable-entry? [old-entry ^java.io.File image-file]
+(defn- reusable-entry? [old-entry ^java.io.File image-file config]
   (and old-entry
        (= (:size old-entry) (.length image-file))
-       (= (:last-modified old-entry) (.lastModified image-file))))
+       (= (:last-modified old-entry) (.lastModified image-file))
+       (= (:semantic-model old-entry) (:vision-model config))
+       (contains? old-entry :caption)
+       (contains? old-entry :token-freq)))
 
-(defn- build-index! [images-dir index-file]
+(defn- summarize-refresh [existing total new-count changed-count removed-count]
+  (println (if (seq (:entries existing))
+             "refreshing index..."
+             "building index..."))
+  (println (format "total=%d new=%d changed=%d removed=%d"
+                   total new-count changed-count removed-count)))
+
+(defn- maybe-progress! [processed total]
+  (when (or (= processed total)
+            (= processed 1)
+            (zero? (mod processed 25)))
+    (println (format "processed %d/%d changed images" processed total))))
+
+(defn- build-index! [config]
   (ensure-prerequisites!)
-  (let [images (collect-images images-dir)
+  (let [images-dir (:images-dir config)
+        index-file (:index-file config)
+        images (collect-images images-dir)
         existing (load-index index-file)
         old-by-path (previous-entry-by-path (:entries existing))
+        removed-count (count (remove (set (map #(.getAbsolutePath ^java.io.File %) images))
+                                     (keys old-by-path)))
         total (count images)]
     (when (zero? total)
       (throw (ex-info "No supported image files found" {:images-dir images-dir})))
-    (println "Found" total "images.")
-    (let [entries
-          (mapv (fn [idx ^java.io.File image-file]
-                  (let [path (.getAbsolutePath image-file)
-                        old-entry (get old-by-path path)]
-                    (println (format "[%d/%d] %s" (inc idx) total (.getName image-file)))
-                    (if (reusable-entry? old-entry image-file)
-                      old-entry
-                      (build-entry image-file))))
-                (range total)
-                images)
-          index-data {:version 1
-                      :images-dir (.getAbsolutePath (io/file images-dir))
-                      :entry-count total
-                      :entries entries}]
-      (write-edn-file! index-file index-data)
-      (println "Wrote index to" (.getAbsolutePath (io/file index-file)))
-      index-data)))
+    (let [statuses (mapv (fn [^java.io.File image-file]
+                           (let [path (.getAbsolutePath image-file)
+                                 old-entry (get old-by-path path)
+                                 status (cond
+                                          (nil? old-entry) :new
+                                          (reusable-entry? old-entry image-file config) :reused
+                                          :else :changed)]
+                             {:file image-file
+                              :old-entry old-entry
+                              :status status}))
+                         images)
+          new-count (count (filter #(= :new (:status %)) statuses))
+          changed-count (count (filter #(= :changed (:status %)) statuses))
+          process-total (+ new-count changed-count)]
+      (summarize-refresh existing total new-count changed-count removed-count)
+      (if (and (zero? process-total)
+               (zero? removed-count)
+               (= (:images-dir existing) images-dir)
+               (= (:version existing) index-version)
+               (= (:vision-model existing) (:vision-model config))
+               (= (:rank-model existing) (:rank-model config)))
+        (do
+          (println "index is up to date.")
+          existing)
+        (let [processed (atom 0)
+              entries (mapv (fn [{:keys [^java.io.File file old-entry status]}]
+                              (case status
+                                :reused old-entry
+                                (let [entry (build-entry config file)]
+                                  (swap! processed inc)
+                                  (maybe-progress! @processed process-total)
+                                  entry)))
+                            statuses)
+              index-data {:version index-version
+                          :images-dir images-dir
+                          :vision-model (:vision-model config)
+                          :rank-model (:rank-model config)
+                          :entry-count (count entries)
+                          :entries entries}]
+          (write-edn-file! index-file index-data)
+          (println "saved index to" index-file)
+          index-data)))))
 
 (defn- document-frequencies [entries]
   (reduce (fn [acc {:keys [token-freq]}]
@@ -201,48 +377,140 @@
    0.0
    query-freq))
 
-(defn- phrase-bonus [query ocr-text]
+(defn- phrase-bonus [query candidate]
   (let [query (normalize-text (str/lower-case query))
-        ocr-text (normalize-text (str/lower-case ocr-text))
-        short-candidate? (< (count ocr-text) 8)]
+        candidate (normalize-text (str/lower-case candidate))
+        short-candidate? (< (count candidate) 8)]
     (cond
-      (or (str/blank? query) (str/blank? ocr-text) short-candidate?) 0.0
-      (str/includes? ocr-text query) 6.0
-      (str/includes? query ocr-text) 3.0
+      (or (str/blank? query) (str/blank? candidate) short-candidate?) 0.0
+      (str/includes? candidate query) 6.0
+      (str/includes? query candidate) 2.0
       :else 0.0)))
 
 (defn- score-entry [query query-freq doc-freq total-docs entry]
   (+ (overlap-score query-freq (:token-freq entry) doc-freq total-docs)
-     (phrase-bonus query (:ocr-text entry))))
+     (phrase-bonus query (:search-text entry))
+     (if (some #(= % (str/lower-case (normalize-text query))) (:reaction-tags entry)) 2.0 0.0)))
 
-(defn- snippet-for [ocr-text]
-  (let [text (normalize-text ocr-text)]
-    (if (> (count text) 120)
-      (str (subs text 0 117) "...")
-      text)))
+(defn- candidate-summary [entry]
+  {:id (:id entry)
+   :caption (:caption entry)
+   :reaction_tags (:reaction-tags entry)
+   :scene_tags (:scene-tags entry)
+   :emotions (:emotions entry)
+   :people (:people entry)
+   :notes (:notes entry)
+   :visible_text (clip-text (:visible-text entry) 200)})
 
-(defn- query-index [index-file query-text top-n]
-  (let [{:keys [entries]} (load-index index-file)]
+(defn- rerank-prompt [query candidates]
+  (str
+   "You are choosing the best reaction image for a conversation snippet.\n"
+   "Pick the single best candidate id from the provided metadata.\n"
+   "Return JSON only in this shape: "
+   "{\"best_id\":\"string\",\"reason\":\"string\",\"alternate_ids\":[\"string\"]}\n"
+   "Rules:\n"
+   "- best_id must be exactly one of the candidate ids.\n"
+   "- alternate_ids may contain up to 3 other ids from the candidate list.\n"
+   "- Prefer images that feel like a reaction, not just a topical keyword match.\n"
+   "- Keep reason to one short sentence.\n\n"
+   "User query:\n"
+   query
+   "\n\nCandidates:\n"
+   (json/write-str (mapv candidate-summary candidates))))
+
+(defn- rerank-candidates! [config query candidates]
+  (let [response (ollama/chat! (:host config)
+                               (:rank-model config)
+                               (rerank-prompt query candidates)
+                               {:format "json"
+                                :temperature 0.1})
+        payload (parse-json-content (ollama/assistant-content response))
+        allowed-ids (set (map :id candidates))
+        best-id (when (contains? allowed-ids (:best_id payload))
+                  (:best_id payload))
+        alternate-ids (->> (:alternate_ids payload)
+                           as-string-vec
+                           (filter allowed-ids)
+                           (remove #(= % best-id))
+                           vec)]
+    (when best-id
+      {:best-id best-id
+       :reason (or (non-blank (:reason payload)) "")
+       :alternate-ids alternate-ids})))
+
+(defn- snippet-for [entry]
+  (or (non-blank (:caption entry))
+      (non-blank (:notes entry))
+      (non-blank (:visible-text entry))
+      ""))
+
+(defn- lexical-shortlist [entries query-text candidate-count]
+  (let [query-freq (token-frequencies query-text)
+        total-docs (count entries)
+        doc-freq (document-frequencies entries)]
+    (->> entries
+         (map (fn [entry]
+                (assoc entry :score (score-entry query-text query-freq doc-freq total-docs entry))))
+         (filter #(pos? (:score %)))
+         (sort-by (juxt (comp - :score) :id))
+         (take candidate-count)
+         vec)))
+
+(defn- reorder-with-rerank [candidates {:keys [best-id alternate-ids]}]
+  (let [by-id (into {} (map (juxt :id identity) candidates))
+        preferred-ids (concat [best-id] alternate-ids)
+        preferred (keep by-id preferred-ids)
+        preferred-set (set preferred-ids)
+        remainder (remove #(contains? preferred-set (:id %)) candidates)]
+    (vec (concat preferred remainder))))
+
+(defn- resolve-images-dir [config existing-index]
+  (or (:images-dir config)
+      (:images-dir existing-index)
+      (throw (ex-info "Provide --images-dir on the first run so the index knows which folder to watch." {}))))
+
+(defn- refresh-index! [config]
+  (let [existing (load-index (:index-file config))
+        config (assoc config :images-dir (resolve-images-dir config existing))]
+    (build-index! config)))
+
+(defn- print-query-result [ranked rerank]
+  (let [best (first ranked)]
+    (println (str "best: " (:path best)))
+    (println (str "  id: " (:id best)))
+    (when-let [reason (non-blank (:reason rerank))]
+      (println (str "  reason: " reason)))
+    (when-let [caption (non-blank (:caption best))]
+      (println (str "  caption: " caption)))
+    (when (seq (:reaction-tags best))
+      (println (str "  reaction_tags: " (str/join ", " (:reaction-tags best)))))
+    (when-let [notes (non-blank (:notes best))]
+      (println (str "  notes: " notes)))
+    (when (> (count ranked) 1)
+      (println "alternates:")
+      (doseq [entry (take 4 (rest ranked))]
+        (println (str "  - " (:path entry)))
+        (when-let [snippet (non-blank (snippet-for entry))]
+          (println (str "    " (clip-text snippet 120))))))))
+
+(defn- query-index [config query-text]
+  (let [index (refresh-index! config)
+        entries (:entries index)]
     (when (empty? entries)
-      (throw (ex-info "Index file is empty or missing entries" {:index-file index-file})))
-    (let [query-freq (token-frequencies query-text)
-          total-docs (count entries)
-          doc-freq (document-frequencies entries)
-          ranked (->> entries
-                      (map (fn [entry]
-                             (assoc entry :score (score-entry query-text query-freq doc-freq total-docs entry))))
-                      (filter #(pos? (:score %)))
-                      (sort-by (juxt (comp - :score) :path))
-                      (take top-n)
-                      vec)]
-      (when (empty? ranked)
-        (println "No OCR-backed matches found.")
+      (throw (ex-info "Index file is empty or missing entries" {:index-file (:index-file config)})))
+    (let [candidates (lexical-shortlist entries query-text (:candidate-count config))]
+      (when (empty? candidates)
+        (println "No lexical matches found in the current index.")
         (System/exit 2))
-      (doseq [{:keys [score path ocr-text]} ranked]
-        (println (format "%.3f\t%s" score path))
-        (when-not (str/blank? ocr-text)
-          (println (str "  " (snippet-for ocr-text)))))
-      ranked)))
+      (let [rerank (try
+                     (rerank-candidates! config query-text candidates)
+                     (catch Exception _
+                       nil))
+            ranked (if rerank
+                     (reorder-with-rerank candidates rerank)
+                     candidates)]
+        (print-query-result (take (:top-n config) ranked) rerank)
+        ranked))))
 
 (defn- require-option [opts key-name]
   (or (get opts key-name)
@@ -251,19 +519,18 @@
 
 (defn- run-index! [args]
   (let [opts (parse-args args)
-        images-dir (require-option opts :images-dir)
-        index-file (or (:index-file opts) (.getAbsolutePath default-index-file))]
-    (build-index! images-dir index-file)))
+        config (assoc (default-config opts)
+                      :images-dir (canonical-path (require-option opts :images-dir)))]
+    (build-index! config)))
 
 (defn- run-query! [args]
   (let [opts (parse-args args)
-        index-file (or (:index-file opts) (.getAbsolutePath default-index-file))
-        top-n (Long/parseLong (or (:top opts) "5"))
+        config (default-config opts)
         query-text (or (:text opts)
                        (some->> (:positionals opts) seq (str/join " ")))]
     (when (str/blank? query-text)
       (throw (ex-info "Provide query text with --text" {})))
-    (query-index index-file query-text top-n)))
+    (query-index config query-text)))
 
 (defn -main [& argv]
   (try

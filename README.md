@@ -2,22 +2,100 @@
 
 Local-first reaction image retrieval for macOS.
 
-Task 1 MVP:
+The project now has two stages:
 
-- Build a local OCR index from a folder of reaction images.
-- Query that index with typed text.
-- Return the best-matching image paths.
-- OCR is powered by the locally installed `tesseract` CLI.
-- Matching is lexical against extracted image text, not semantic yet.
+1. Index time:
+   each image is analyzed once and stored as structured metadata.
+2. Query time:
+   typed text is matched against that metadata, then a rerank model picks the best reaction image from the shortlist.
 
-Usage:
+## Requirements
 
-- `clojure -M:run index --images-dir "/path/to/images"`
-- `clojure -M:run query --text "microwave time" --top 5`
+- macOS
+- `clojure`
+- `tesseract`
+- `ollama`
 
-Planned later:
+Recommended Ollama model setup:
 
-- Screenshot OCR input
-- Clipboard image paste
-- Finder tag integration
-- Better semantic ranking
+```bash
+ollama pull qwen2.5vl:3b
+```
+
+Defaults:
+
+- vision model: `qwen2.5vl:3b`
+- rank model: same as the vision model unless overridden
+- host: `OLLAMA_HOST` or `http://localhost:11434`
+
+## Indexed Shape
+
+Each image is stored with metadata similar to:
+
+```json
+{
+  "id": "HZgWYgWDCFgYDAF1IN1pQEgY.jpg",
+  "caption": "long screenshot of a forum post about Emacs",
+  "reaction_tags": ["rant", "nerdy", "overexplaining", "argumentative"],
+  "scene_tags": ["screenshot", "text-heavy", "forum"],
+  "visible_text": "Emacs ...",
+  "people": [],
+  "emotions": ["frustrated", "smug"],
+  "notes": "works as a reaction to long-winded technical arguments"
+}
+```
+
+`id` is always the image filename including its extension.
+
+## Behavior
+
+- The first build is slow because it creates the semantic index.
+- The index is stored at `.maymay-reactor/index.edn`.
+- On later runs, the app checks the indexed `images-dir` automatically.
+- Only new files or files whose size / modification time changed are reprocessed.
+- Removed files disappear from the refreshed index.
+- OCR is still stored, but it is now only one signal among several.
+
+## Usage
+
+Build or refresh the index:
+
+```bash
+clojure -M:run index --images-dir "/path/to/images"
+```
+
+Query with typed text:
+
+```bash
+clojure -M:run query --text "bro what" --images-dir "/path/to/images"
+```
+
+Override models:
+
+```bash
+clojure -M:run index \
+  --images-dir "/path/to/images" \
+  --vision-model "qwen2.5vl:3b" \
+  --rank-model "qwen2.5vl:3b"
+```
+
+## Tests
+
+Run:
+
+```bash
+clojure -M:test
+```
+
+Current tests cover:
+
+- semantic search-text construction
+- unchanged-file reuse
+- changed-file reprocessing
+- lexical shortlist behavior over semantic metadata
+
+## Next
+
+- screenshot input
+- clipboard image input
+- stronger shortlist retrieval beyond lexical metadata matching
