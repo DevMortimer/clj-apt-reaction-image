@@ -1,4 +1,4 @@
-(ns maymay-reactor.ollama
+(ns clj-apt-reaction-image.ollama
   (:require
    [clojure.data.json :as json]
    [clojure.java.io :as io]

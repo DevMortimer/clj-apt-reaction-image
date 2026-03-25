@@ -1,4 +1,4 @@
-# maymay-reactor
+# clj-apt-reaction-image
 
 Local-first reaction image retrieval for macOS.
 
@@ -53,7 +53,7 @@ Each image is stored with metadata similar to:
 
 - The first build is slow because it creates the semantic index.
 - Before each semantic call, the app resizes the image for vision inference instead of sending the full original file.
-- The index is stored at `.maymay-reactor/index.edn`.
+- The index is stored at `.clj-apt-reaction-image/index.edn`.
 - The index is checkpointed during long runs so partial progress is written to disk.
 - On later runs, the app checks the indexed `images-dir` automatically.
 - Only new files or files whose size / modification time changed are reprocessed.

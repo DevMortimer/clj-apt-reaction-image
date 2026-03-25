@@ -2,7 +2,7 @@
  :paths ["src"]
  :aliases
  {:run
-  {:main-opts ["-m" "maymay-reactor.core"]}
+  {:main-opts ["-m" "clj-apt-reaction-image.core"]}
   :test
   {:extra-paths ["test"]
-   :main-opts ["-m" "maymay-reactor.core-test"]}}}
+   :main-opts ["-m" "clj-apt-reaction-image.core-test"]}}}

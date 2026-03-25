@@ -1,12 +1,12 @@
-(ns maymay-reactor.core-test
+(ns clj-apt-reaction-image.core-test
   (:require
    [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is run-tests]]
-   [maymay-reactor.core :as core]))
+   [clj-apt-reaction-image.core :as core]))
 
 (defn- temp-dir []
-  (.toFile (java.nio.file.Files/createTempDirectory "maymay-reactor-test" (make-array java.nio.file.attribute.FileAttribute 0))))
+  (.toFile (java.nio.file.Files/createTempDirectory "clj-apt-reaction-image-test" (make-array java.nio.file.attribute.FileAttribute 0))))
 
 (defn- write-file! [dir name contents]
   (let [f (io/file dir name)]
@@ -138,5 +138,5 @@
     (is (= "a.jpg" (:id (first ranked))))))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'maymay-reactor.core-test)]
+  (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

@@ -1,4 +1,4 @@
-(ns maymay-reactor.core
+(ns clj-apt-reaction-image.core
   (:gen-class)
   (:require
    [clojure.data.json :as json]
@@ -6,7 +6,7 @@
    [clojure.java.io :as io]
    [clojure.java.shell :as sh]
    [clojure.string :as str]
-   [maymay-reactor.ollama :as ollama]))
+   [clj-apt-reaction-image.ollama :as ollama]))
 
 (def ^:private index-version 3)
 (def ^:private semantic-revision 2)
@@ -17,7 +17,7 @@
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
 (def ^:private cache-dir
-  (io/file project-dir ".maymay-reactor"))
+  (io/file project-dir ".clj-apt-reaction-image"))
 (def ^:private default-index-file
   (io/file cache-dir "index.edn"))
 (def ^:private supported-extensions
@@ -30,7 +30,7 @@
 (defn- usage []
   (str/join
    \newline
-   ["maymay-reactor"
+   ["clj-apt-reaction-image"
     ""
     "Commands:"
     "  index --images-dir PATH [--index-file PATH] [--vision-model MODEL] [--rank-model MODEL]"
