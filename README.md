@@ -75,11 +75,26 @@ Query with typed text:
 clojure -M:run query --text "bro what" --images-dir "/path/to/images"
 ```
 
+Query with a screenshot or pasted image saved to disk:
+
+```bash
+clojure -M:run query --image "/path/to/chat-screenshot.png" --images-dir "/path/to/images"
+```
+
 Machine-readable query output for app integrations:
 
 ```bash
 clojure -M:run query \
   --text "bro what" \
+  --images-dir "/path/to/images" \
+  --output json
+```
+
+Machine-readable screenshot query output:
+
+```bash
+clojure -M:run query \
+  --image "/path/to/chat-screenshot.png" \
   --images-dir "/path/to/images" \
   --output json
 ```
@@ -122,6 +137,9 @@ swift build --package-path mac/CljAptReactionImageMac
 The current app shell supports:
 
 - text query input
+- image query input from file chooser
+- image query input from clipboard paste
+- image query input from drag and drop
 - native result cards for ranked reaction images
 - configurable backend root and dataset directory
 - subprocess calls into the Clojure backend over `--output json`

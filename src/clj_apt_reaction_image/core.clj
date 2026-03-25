@@ -35,7 +35,7 @@
     ""
     "Commands:"
     "  index --images-dir PATH [--index-file PATH] [--vision-model MODEL] [--rank-model MODEL] [--output text|json]"
-    "  query --text \"message here\" [--images-dir PATH] [--index-file PATH] [--top N] [--output text|json]"
+    "  query (--text \"message here\" | --image PATH) [--images-dir PATH] [--index-file PATH] [--top N] [--output text|json]"
     ""
     "Defaults:"
     (str "  vision model: " default-vision-model)
@@ -46,7 +46,8 @@
     ""
     "Examples:"
     "  clojure -M:run index --images-dir \"/path/to/images\""
-    "  clojure -M:run query --text \"bro what\" --images-dir \"/path/to/images\""]))
+    "  clojure -M:run query --text \"bro what\" --images-dir \"/path/to/images\""
+    "  clojure -M:run query --image \"/path/to/chat-screenshot.png\" --images-dir \"/path/to/images\""]))
 
 (defn- ensure-dir! [^java.io.File dir]
   (.mkdirs dir)
@@ -545,6 +546,41 @@
         payload (parse-json-content (ollama/assistant-content response))]
     (normalize-query-profile query payload)))
 
+(defn- image-query-analysis-prompt [ocr-text]
+  (str
+   "You are extracting reaction-search intent from an uploaded image.\n"
+   "The image is usually a chat screenshot, social post, or some visual situation that should trigger a reaction image.\n"
+   "Return JSON only in this shape: "
+   "{\"query_text\":\"string\",\"intent\":\"string\",\"desired_reaction_tags\":[\"string\"],"
+   "\"tone\":[\"string\"],\"keywords\":[\"string\"]}\n"
+   "Rules:\n"
+   "- query_text: one short natural-language summary of the situation.\n"
+   "- intent: one short sentence describing the reaction vibe that would fit.\n"
+   "- desired_reaction_tags: max 6 short lowercase tags for the kind of reaction image that would work.\n"
+   "- tone: max 4 short lowercase tags.\n"
+   "- keywords: max 6 short lowercase words or short phrases.\n"
+   "- Prefer social/conversational meaning over literal object listing.\n"
+   "- If the image is a conversation screenshot, infer what kind of reaction image someone would send back.\n"
+   "- If OCR text is noisy, trust the image more than OCR.\n\n"
+   (if (str/blank? ocr-text)
+     ""
+     (str "OCR hint from a separate tool:\n"
+          (clip-text ocr-text 360)
+          "\n\n"))))
+
+(defn- analyze-image-query! [config image-path ocr-text]
+  (let [image-file (io/file image-path)
+        prepared-image (prepare-vision-image! config image-file)
+        response (ollama/chat! (:host config)
+                               (:rank-model config)
+                               (image-query-analysis-prompt ocr-text)
+                               {:images [prepared-image]
+                                :format "json"
+                                :temperature 0.1})
+        payload (parse-json-content (ollama/assistant-content response))
+        fallback-query (or (non-blank ocr-text) (.getName image-file) "image query")]
+    (normalize-query-profile fallback-query payload)))
+
 (defn- build-query-search-text [query profile]
   (str/join
    " "
@@ -716,8 +752,11 @@
    :visible_text (:visible-text entry)
    :ocr_text (:ocr-text entry)})
 
-(defn- query-result->response [{:keys [query-text profile rerank ranked best]}]
-  {:query_text query-text
+(defn- query-result->response [{:keys [query-text profile rerank ranked best source-type source-image-path source-ocr-text]}]
+  {:source_type (some-> source-type name)
+   :source_image_path source-image-path
+   :source_ocr_text source-ocr-text
+   :query_text query-text
    :profile {:query_text (:query-text profile)
              :intent (:intent profile)
              :desired_reaction_tags (:desired-reaction-tags profile)
@@ -752,20 +791,89 @@
         (= "json" (str/lower-case (or (second args) "")))
         (recur (next args))))))
 
-(defn- query-index [config query-text]
+(defn- blankish? [s]
+  (str/blank? (normalize-text s)))
+
+(defn- build-query-request! [opts positionals]
+  (let [text (or (:text opts)
+                 (some->> positionals seq (str/join " ")))
+        image-path (:image opts)
+        text? (not (blankish? text))
+        image? (not (blankish? image-path))]
+    (cond
+      (and text? image?)
+      (throw (ex-info "Provide either --text or --image, not both."
+                      {:type :usage
+                       :exit-code 1}))
+
+      text?
+      {:type :text
+       :query-text text}
+
+      image?
+      {:type :image
+       :image-path (canonical-path image-path)}
+
+      :else
+      (throw (ex-info "Provide query input with --text or --image."
+                      {:type :usage
+                       :exit-code 1})))))
+
+(defn- empty-query-profile [query-text]
+  {:query-text query-text
+   :intent ""
+   :desired-reaction-tags []
+   :tone []
+   :keywords []})
+
+(defn- resolve-query-context [config query-request]
+  (case (:type query-request)
+    :image
+    (let [image-path (:image-path query-request)
+          ocr-text (try
+                     (or (ocr-image! image-path) "")
+                     (catch Exception _
+                       ""))
+          fallback-query (or (non-blank ocr-text)
+                             (.getName (io/file image-path))
+                             "image query")
+          profile (try
+                    (analyze-image-query! config image-path ocr-text)
+                    (catch Exception _
+                      (empty-query-profile fallback-query)))]
+      {:source-type :image
+       :source-image-path image-path
+       :source-ocr-text ocr-text
+       :query-text (:query-text profile)
+       :profile profile})
+
+    :text
+    (let [query-text (:query-text query-request)
+          profile (try
+                    (analyze-query! config query-text)
+                    (catch Exception _
+                      (empty-query-profile query-text)))]
+      {:source-type :text
+       :query-text (:query-text profile)
+       :profile profile})
+
+    (throw (ex-info "Unsupported query request."
+                    {:type :usage
+                     :exit-code 1
+                     :query-request query-request}))))
+
+(defn- query-index [config query-input]
   (let [index (refresh-index! config)
+        query-request (if (string? query-input)
+                        {:type :text
+                         :query-text query-input}
+                        query-input)
+        {:keys [query-text profile source-type source-image-path source-ocr-text]}
+        (resolve-query-context config query-request)
         entries (:entries index)]
     (when (empty? entries)
       (throw (ex-info "Index file is empty or missing entries" {:index-file (:index-file config)})))
-    (let [profile (try
-                    (analyze-query! config query-text)
-                    (catch Exception _
-                      {:query-text query-text
-                       :intent ""
-                       :desired-reaction-tags []
-                       :tone []
-                       :keywords []}))
-          enhanced-query (build-query-search-text query-text profile)
+    (let [enhanced-query (build-query-search-text query-text profile)
           _ (when (seq (:desired-reaction-tags profile))
               (log! config (str "query tags: " (str/join ", " (:desired-reaction-tags profile)))))
           lexical-candidates (lexical-shortlist entries enhanced-query (:candidate-count config))
@@ -788,6 +896,9 @@
                      (reorder-with-rerank candidates rerank)
                      candidates)]
         {:query-text query-text
+         :source-type source-type
+         :source-image-path source-image-path
+         :source-ocr-text source-ocr-text
          :profile profile
          :enhanced-query enhanced-query
          :index index
@@ -805,12 +916,12 @@
     (build-index! config)))
 
 (defn query!
-  [opts query-text]
-  (when (str/blank? query-text)
-    (throw (ex-info "Provide query text with --text"
-                    {:type :usage
-                     :exit-code 1})))
-  (query-index (default-config opts) query-text))
+  [opts query-input]
+  (query-index (default-config opts)
+               (if (string? query-input)
+                 {:type :text
+                  :query-text query-input}
+                 query-input)))
 
 (defn- require-option [opts key-name]
   (or (get opts key-name)
@@ -835,13 +946,8 @@
         config (assoc (default-config opts)
                       :log-fn (when-not (= "json" (str/lower-case (or (:output opts) "text")))
                                 println))
-        query-text (or (:text opts)
-                       (some->> (:positionals opts) seq (str/join " ")))]
-    (when (str/blank? query-text)
-      (throw (ex-info "Provide query text with --text"
-                      {:type :usage
-                       :exit-code 1})))
-    (let [result (query-index config query-text)]
+        query-request (build-query-request! opts (:positionals opts))]
+    (let [result (query-index config query-request)]
       (if (json-output? config)
         (print-json! (query-result->response result))
         (print-query-result (:ranked result) (:rerank result)))

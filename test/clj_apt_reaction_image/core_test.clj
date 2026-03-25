@@ -158,6 +158,26 @@
     (is (= ["casual"] (:tone profile)))
     (is (= ["what"] (:keywords profile)))))
 
+(deftest build-query-request-validates-text-vs-image
+  (let [image-path (.getAbsolutePath (io/file "/tmp/chat.png"))
+        canonical-image-path (.getAbsolutePath (.getCanonicalFile (io/file image-path)))]
+    (is (= {:type :text
+            :query-text "bro what"}
+           (#'core/build-query-request! {:text "bro what"} [])))
+    (is (= {:type :image
+            :image-path canonical-image-path}
+           (#'core/build-query-request! {:image image-path} [])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"either --text or --image"
+         (#'core/build-query-request! {:text "bro what"
+                                       :image image-path}
+                                      [])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Provide query input"
+         (#'core/build-query-request! {} [])))))
+
 (deftest query-index-returns-structured-result-without-cli-output
   (let [entry-a {:id "a.jpg"
                  :path "/tmp/a.jpg"
@@ -223,6 +243,59 @@
           (is (= "Best fit for disbelief." (get-in result [:rerank :reason])))
           (is (= ["disbelief"] (get-in result [:profile :desired-reaction-tags]))))))))
 
+(deftest query-index-supports-image-source
+  (let [entry-a {:id "a.jpg"
+                 :path "/tmp/a.jpg"
+                 :caption "angry face"
+                 :reaction-tags ["angry"]
+                 :scene-tags ["closeup"]
+                 :people []
+                 :emotions ["furious"]
+                 :notes "good for bad takes"
+                 :visible-text ""
+                 :ocr-text ""
+                 :search-text (#'core/build-search-text {:caption "angry face"
+                                                         :reaction-tags ["angry"]
+                                                         :scene-tags ["closeup"]
+                                                         :people []
+                                                         :emotions ["furious"]
+                                                         :notes "good for bad takes"
+                                                         :visible-text ""
+                                                         :ocr-text ""})}
+        entries [(assoc entry-a :token-freq (#'core/token-frequencies (:search-text entry-a)))]
+        image-path "/tmp/chat.png"
+        result* (atom nil)]
+    (with-redefs-fn
+      {#'core/refresh-index! (fn [_] {:entries entries})
+       #'core/ocr-image! (fn [_] "bro what is this")
+       #'core/analyze-image-query! (fn [_ path ocr]
+                                     (is (= image-path path))
+                                     (is (= "bro what is this" ocr))
+                                     {:query-text "someone said something insane"
+                                      :intent "annoyed disbelief"
+                                      :desired-reaction-tags ["angry" "disbelief"]
+                                      :tone ["casual"]
+                                      :keywords ["insane"]})
+       #'core/rerank-candidates! (fn [_ query _ candidates]
+                                   (is (= "someone said something insane" query))
+                                   (is (= ["a.jpg"] (mapv :id candidates)))
+                                   {:best-id "a.jpg"
+                                    :reason "Fits annoyed disbelief."
+                                    :alternate-ids []})}
+      (fn []
+        (reset! result* (#'core/query-index {:index-file "index.edn"
+                                             :top-n 3
+                                             :candidate-count 5}
+                                            {:type :image
+                                             :image-path image-path}))))
+    (let [result @result*]
+      (is (= :image (:source-type result)))
+      (is (= image-path (:source-image-path result)))
+      (is (= "bro what is this" (:source-ocr-text result)))
+      (is (= "someone said something insane" (:query-text result)))
+      (is (= ["angry" "disbelief"] (get-in result [:profile :desired-reaction-tags])))
+      (is (= "a.jpg" (get-in result [:best :id]))))))
+
 (deftest query-result-response-uses-json-friendly-keys
   (let [ranked [{:id "a.jpg"
                  :path "/tmp/a.jpg"
@@ -246,6 +319,9 @@
                  :ocr-text ""}]
         response (#'core/query-result->response
                   {:query-text "bruh"
+                   :source-type :image
+                   :source-image-path "/tmp/chat.png"
+                   :source-ocr-text "bro what"
                    :profile {:query-text "bruh"
                              :intent "annoyed disbelief"
                              :desired-reaction-tags ["angry"]
@@ -254,6 +330,9 @@
                    :rerank {:reason "Best fit."}
                    :ranked ranked
                    :best (first ranked)})]
+    (is (= "image" (:source_type response)))
+    (is (= "/tmp/chat.png" (:source_image_path response)))
+    (is (= "bro what" (:source_ocr_text response)))
     (is (= "bruh" (:query_text response)))
     (is (= ["angry"] (get-in response [:profile :desired_reaction_tags])))
     (is (= "a.jpg" (get-in response [:best :id])))

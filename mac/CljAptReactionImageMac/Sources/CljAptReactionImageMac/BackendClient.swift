@@ -1,6 +1,9 @@
 import Foundation
 
 struct QueryResponse: Decodable {
+    let sourceType: String?
+    let sourceImagePath: String?
+    let sourceOcrText: String?
     let queryText: String
     let profile: QueryProfile
     let best: RankedImage?
@@ -58,12 +61,25 @@ enum BackendClientError: LocalizedError {
 
 struct BackendClient {
     func query(text: String, imagesDir: String, backendRoot: String) throws -> QueryResponse {
+        try query(arguments: [
+            "--text",
+            text
+        ], imagesDir: imagesDir, backendRoot: backendRoot)
+    }
+
+    func query(imagePath: String, imagesDir: String, backendRoot: String) throws -> QueryResponse {
+        try query(arguments: [
+            "--image",
+            imagePath
+        ], imagesDir: imagesDir, backendRoot: backendRoot)
+    }
+
+    private func query(arguments: [String], imagesDir: String, backendRoot: String) throws -> QueryResponse {
         let output = try run(
             arguments: [
                 "-M:run",
                 "query",
-                "--text",
-                text,
+            ] + arguments + [
                 "--images-dir",
                 imagesDir,
                 "--output",
