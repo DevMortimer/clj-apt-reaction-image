@@ -158,6 +158,109 @@
     (is (= ["casual"] (:tone profile)))
     (is (= ["what"] (:keywords profile)))))
 
+(deftest query-index-returns-structured-result-without-cli-output
+  (let [entry-a {:id "a.jpg"
+                 :path "/tmp/a.jpg"
+                 :caption "woman staring at phone in disbelief"
+                 :reaction-tags ["disbelief" "speechless"]
+                 :scene-tags ["phone"]
+                 :people []
+                 :emotions ["shocked"]
+                 :notes "good for unexpected messages"
+                 :visible-text ""
+                 :ocr-text ""
+                 :search-text (#'core/build-search-text {:caption "woman staring at phone in disbelief"
+                                                         :reaction-tags ["disbelief" "speechless"]
+                                                         :scene-tags ["phone"]
+                                                         :people []
+                                                         :emotions ["shocked"]
+                                                         :notes "good for unexpected messages"
+                                                         :visible-text ""
+                                                         :ocr-text ""})}
+        entry-b {:id "b.jpg"
+                 :path "/tmp/b.jpg"
+                 :caption "happy thumbs up"
+                 :reaction-tags ["approval"]
+                 :scene-tags ["person"]
+                 :people []
+                 :emotions ["happy"]
+                 :notes "good for saying yes"
+                 :visible-text ""
+                 :ocr-text ""
+                 :search-text (#'core/build-search-text {:caption "happy thumbs up"
+                                                         :reaction-tags ["approval"]
+                                                         :scene-tags ["person"]
+                                                         :people []
+                                                         :emotions ["happy"]
+                                                         :notes "good for saying yes"
+                                                         :visible-text ""
+                                                         :ocr-text ""})}
+        entries (mapv #(assoc % :token-freq (#'core/token-frequencies (:search-text %))) [entry-a entry-b])
+        result* (atom nil)]
+    (with-redefs-fn
+      {#'core/refresh-index! (fn [_] {:entries entries})
+       #'core/analyze-query! (fn [_ query]
+                               {:query-text query
+                                :intent "disbelief at unexpected message"
+                                :desired-reaction-tags ["disbelief"]
+                                :tone ["casual"]
+                                :keywords ["unexpected"]})
+       #'core/lexical-shortlist (fn [_ _ _] entries)
+       #'core/rerank-candidates! (fn [_ _ _ _]
+                                   {:best-id "a.jpg"
+                                    :reason "Best fit for disbelief."
+                                    :alternate-ids ["b.jpg"]})}
+      (fn []
+        (let [output (with-out-str
+                       (reset! result* (#'core/query-index {:index-file "index.edn"
+                                                            :top-n 2
+                                                            :candidate-count 5}
+                                                           "bro what")))
+              result @result*]
+          (is (= "" output))
+          (is (= "a.jpg" (get-in result [:best :id])))
+          (is (= ["a.jpg" "b.jpg"] (mapv :id (:ranked result))))
+          (is (= "Best fit for disbelief." (get-in result [:rerank :reason])))
+          (is (= ["disbelief"] (get-in result [:profile :desired-reaction-tags]))))))))
+
+(deftest query-result-response-uses-json-friendly-keys
+  (let [ranked [{:id "a.jpg"
+                 :path "/tmp/a.jpg"
+                 :caption "angry face"
+                 :reaction-tags ["angry" "mad"]
+                 :scene-tags ["closeup"]
+                 :people []
+                 :emotions ["furious"]
+                 :notes "good for bad takes"
+                 :visible-text ""
+                 :ocr-text ""}
+                {:id "b.jpg"
+                 :path "/tmp/b.jpg"
+                 :caption "thumbs up"
+                 :reaction-tags ["approval"]
+                 :scene-tags ["person"]
+                 :people []
+                 :emotions ["happy"]
+                 :notes "good for agreement"
+                 :visible-text ""
+                 :ocr-text ""}]
+        response (#'core/query-result->response
+                  {:query-text "bruh"
+                   :profile {:query-text "bruh"
+                             :intent "annoyed disbelief"
+                             :desired-reaction-tags ["angry"]
+                             :tone ["casual"]
+                             :keywords ["bruh"]}
+                   :rerank {:reason "Best fit."}
+                   :ranked ranked
+                   :best (first ranked)})]
+    (is (= "bruh" (:query_text response)))
+    (is (= ["angry"] (get-in response [:profile :desired_reaction_tags])))
+    (is (= "a.jpg" (get-in response [:best :id])))
+    (is (= "Best fit." (get-in response [:best :reason])))
+    (is (= ["b.jpg"] (mapv :id (:alternates response))))
+    (is (= ["a.jpg" "b.jpg"] (mapv :id (:ranked response))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))

@@ -34,8 +34,8 @@
    ["clj-apt-reaction-image"
     ""
     "Commands:"
-    "  index --images-dir PATH [--index-file PATH] [--vision-model MODEL] [--rank-model MODEL]"
-    "  query --text \"message here\" [--images-dir PATH] [--index-file PATH] [--top N]"
+    "  index --images-dir PATH [--index-file PATH] [--vision-model MODEL] [--rank-model MODEL] [--output text|json]"
+    "  query --text \"message here\" [--images-dir PATH] [--index-file PATH] [--top N] [--output text|json]"
     ""
     "Defaults:"
     (str "  vision model: " default-vision-model)
@@ -51,6 +51,11 @@
 (defn- ensure-dir! [^java.io.File dir]
   (.mkdirs dir)
   dir)
+
+(defn- log!
+  [config & xs]
+  (when-let [log-fn (:log-fn config)]
+    (apply log-fn xs)))
 
 (defn- normalize-text [s]
   (-> (or s "")
@@ -150,6 +155,7 @@
      :rank-model (or (:rank-model opts)
                      (System/getenv "MAYMAY_RANK_MODEL")
                      vision-model)
+     :output-format (or (:output opts) "text")
      :top-n (Long/parseLong (or (:top opts) "5"))
      :candidate-count (Long/parseLong (or (:candidate-count opts) (str default-candidate-count)))
      :vision-max-side (Long/parseLong (or (:vision-max-side opts)
@@ -321,7 +327,7 @@
                     :path path
                     :size (.length image-file)
                     :last-modified (.lastModified image-file)}]
-    (println (str progress-label " OCR"))
+    (log! config (str progress-label " OCR"))
     (let [total-start (now-ms)
           ocr-start total-start
           ocr-result (try
@@ -330,7 +336,7 @@
                          {:ocr-text ""
                           :ocr-error (.getMessage ex)}))
           ocr-ms (- (now-ms) ocr-start)
-          _ (println (str progress-label " semantic"))
+          _ (log! config (str progress-label " semantic"))
           semantic-start (now-ms)
           semantic-result (try
                             (describe-image! config image-file (:ocr-text ocr-result))
@@ -352,11 +358,12 @@
                         :semantic-revision semantic-revision
                         :vision-max-side (:vision-max-side config)})
           search-text (build-search-text entry)]
-      (println (format "%s done (ocr=%dms semantic=%dms total=%dms)"
-                       progress-label
-                       ocr-ms
-                       semantic-ms
-                       (- (now-ms) total-start)))
+      (log! config
+            (format "%s done (ocr=%dms semantic=%dms total=%dms)"
+                    progress-label
+                    ocr-ms
+                    semantic-ms
+                    (- (now-ms) total-start)))
       (assoc entry
              :search-text search-text
              :token-freq (token-frequencies search-text)))))
@@ -371,12 +378,14 @@
        (contains? old-entry :caption)
        (contains? old-entry :token-freq)))
 
-(defn- summarize-refresh [existing total new-count changed-count removed-count]
-  (println (if (seq (:entries existing))
-             "refreshing index..."
-             "building index..."))
-  (println (format "total=%d new=%d changed=%d removed=%d"
-                   total new-count changed-count removed-count)))
+(defn- summarize-refresh [config existing total new-count changed-count removed-count]
+  (log! config
+        (if (seq (:entries existing))
+          "refreshing index..."
+          "building index..."))
+  (log! config
+        (format "total=%d new=%d changed=%d removed=%d"
+                total new-count changed-count removed-count)))
 
 (defn- make-index-data [config images-dir entries complete?]
   {:version index-version
@@ -417,7 +426,7 @@
           process-total (+ new-count changed-count)
           checkpoint-every (max 1 (long (or (:checkpoint-every config)
                                             default-checkpoint-every)))]
-      (summarize-refresh existing total new-count changed-count removed-count)
+      (summarize-refresh config existing total new-count changed-count removed-count)
       (if (and (zero? process-total)
                (zero? removed-count)
                (= (:images-dir existing) images-dir)
@@ -425,7 +434,7 @@
                (= (:vision-model existing) (:vision-model config))
                (= (:rank-model existing) (:rank-model config)))
         (do
-          (println "index is up to date.")
+          (log! config "index is up to date.")
           existing)
         (loop [remaining statuses
                entries []
@@ -443,14 +452,15 @@
                          (or (= changed-processed' process-total)
                              (zero? (mod changed-processed' checkpoint-every))))
                 (write-edn-file! index-file (make-index-data config images-dir entries' false))
-                (println (format "checkpoint saved (%d/%d changed, %d entries)"
-                                 changed-processed'
-                                 process-total
-                                 (count entries'))))
+                (log! config
+                      (format "checkpoint saved (%d/%d changed, %d entries)"
+                              changed-processed'
+                              process-total
+                              (count entries'))))
               (recur (next remaining) entries' changed-processed'))
             (let [index-data (make-index-data config images-dir entries true)]
               (write-edn-file! index-file index-data)
-              (println "saved index to" index-file)
+              (log! config "saved index to" index-file)
               index-data)))))))
 
 (defn- document-frequencies [entries]
@@ -666,7 +676,9 @@
 (defn- resolve-images-dir [config existing-index]
   (or (:images-dir config)
       (:images-dir existing-index)
-      (throw (ex-info "Provide --images-dir on the first run so the index knows which folder to watch." {}))))
+      (throw (ex-info "Provide --images-dir on the first run so the index knows which folder to watch."
+                      {:type :usage
+                       :exit-code 1}))))
 
 (defn- refresh-index! [config]
   (let [existing (load-index (:index-file config))
@@ -692,6 +704,54 @@
         (when-let [snippet (non-blank (snippet-for entry))]
           (println (str "    " (clip-text snippet 120))))))))
 
+(defn- entry->response [entry]
+  {:id (:id entry)
+   :path (:path entry)
+   :caption (:caption entry)
+   :reaction_tags (:reaction-tags entry)
+   :scene_tags (:scene-tags entry)
+   :people (:people entry)
+   :emotions (:emotions entry)
+   :notes (:notes entry)
+   :visible_text (:visible-text entry)
+   :ocr_text (:ocr-text entry)})
+
+(defn- query-result->response [{:keys [query-text profile rerank ranked best]}]
+  {:query_text query-text
+   :profile {:query_text (:query-text profile)
+             :intent (:intent profile)
+             :desired_reaction_tags (:desired-reaction-tags profile)
+             :tone (:tone profile)
+             :keywords (:keywords profile)}
+   :best (when best
+           (assoc (entry->response best)
+                  :reason (or (:reason rerank) "")))
+   :alternates (mapv entry->response (rest ranked))
+   :ranked (mapv entry->response ranked)})
+
+(defn- index-result->response [index]
+  {:version (:version index)
+   :complete (:complete? index)
+   :images_dir (:images-dir index)
+   :vision_model (:vision-model index)
+   :rank_model (:rank-model index)
+   :vision_max_side (:vision-max-side index)
+   :semantic_revision (:semantic-revision index)
+   :entry_count (:entry-count index)})
+
+(defn- json-output? [config]
+  (= "json" (str/lower-case (or (:output-format config) "text"))))
+
+(defn- print-json! [value]
+  (println (json/write-str value)))
+
+(defn- argv-requests-json? [argv]
+  (loop [args argv]
+    (when-let [arg (first args)]
+      (if (= "--output" arg)
+        (= "json" (str/lower-case (or (second args) "")))
+        (recur (next args))))))
+
 (defn- query-index [config query-text]
   (let [index (refresh-index! config)
         entries (:entries index)]
@@ -707,16 +767,19 @@
                        :keywords []}))
           enhanced-query (build-query-search-text query-text profile)
           _ (when (seq (:desired-reaction-tags profile))
-              (println (str "query tags: " (str/join ", " (:desired-reaction-tags profile)))))
+              (log! config (str "query tags: " (str/join ", " (:desired-reaction-tags profile)))))
           lexical-candidates (lexical-shortlist entries enhanced-query (:candidate-count config))
           candidates (if (seq lexical-candidates)
                        lexical-candidates
                        (do
-                         (println "No lexical shortlist matches found, using model metadata fallback...")
+                         (log! config "No lexical shortlist matches found, using model metadata fallback...")
                          (model-shortlist config query-text profile entries)))]
       (when (empty? candidates)
-        (println "No semantic shortlist matches found in the current index.")
-        (System/exit 2))
+        (throw (ex-info "No semantic shortlist matches found in the current index."
+                        {:type :no-matches
+                         :exit-code 2
+                         :query-text query-text
+                         :index-file (:index-file config)})))
       (let [rerank (try
                      (rerank-candidates! config query-text profile candidates)
                      (catch Exception _
@@ -724,28 +787,65 @@
             ranked (if rerank
                      (reorder-with-rerank candidates rerank)
                      candidates)]
-        (print-query-result (take (:top-n config) ranked) rerank)
-        ranked))))
+        {:query-text query-text
+         :profile profile
+         :enhanced-query enhanced-query
+         :index index
+         :candidates candidates
+         :rerank rerank
+         :ranked (vec (take (:top-n config) ranked))
+         :best (first ranked)}))))
+
+(declare require-option)
+
+(defn index!
+  [opts]
+  (let [config (assoc (default-config opts)
+                      :images-dir (canonical-path (require-option opts :images-dir)))]
+    (build-index! config)))
+
+(defn query!
+  [opts query-text]
+  (when (str/blank? query-text)
+    (throw (ex-info "Provide query text with --text"
+                    {:type :usage
+                     :exit-code 1})))
+  (query-index (default-config opts) query-text))
 
 (defn- require-option [opts key-name]
   (or (get opts key-name)
       (throw (ex-info (str "Missing required option --" (name key-name))
-                      {:option key-name}))))
+                      {:type :usage
+                       :exit-code 1
+                       :option key-name}))))
 
 (defn- run-index! [args]
   (let [opts (parse-args args)
         config (assoc (default-config opts)
+                      :log-fn (when-not (= "json" (str/lower-case (or (:output opts) "text")))
+                                println)
                       :images-dir (canonical-path (require-option opts :images-dir)))]
-    (build-index! config)))
+    (let [result (build-index! config)]
+      (when (json-output? config)
+        (print-json! (index-result->response result)))
+      result)))
 
 (defn- run-query! [args]
   (let [opts (parse-args args)
-        config (default-config opts)
+        config (assoc (default-config opts)
+                      :log-fn (when-not (= "json" (str/lower-case (or (:output opts) "text")))
+                                println))
         query-text (or (:text opts)
                        (some->> (:positionals opts) seq (str/join " ")))]
     (when (str/blank? query-text)
-      (throw (ex-info "Provide query text with --text" {})))
-    (query-index config query-text)))
+      (throw (ex-info "Provide query text with --text"
+                      {:type :usage
+                       :exit-code 1})))
+    (let [result (query-index config query-text)]
+      (if (json-output? config)
+        (print-json! (query-result->response result))
+        (print-query-result (:ranked result) (:rerank result)))
+      result)))
 
 (defn -main [& argv]
   (try
@@ -757,11 +857,19 @@
           (println (usage))
           (System/exit 1))))
     (catch Exception ex
-      (binding [*out* *err*]
-        (println (.getMessage ex))
-        (when-let [err (:err (ex-data ex))]
-          (when-not (str/blank? err)
-            (println err)))
-        (println)
-        (println (usage)))
-      (System/exit 1))))
+      (let [data (ex-data ex)
+            exit-code (or (:exit-code data) 1)
+            json? (argv-requests-json? argv)]
+        (if json?
+          (print-json! {:error {:type (name (or (:type data) :error))
+                                :message (.getMessage ex)
+                                :details (dissoc data :err :exit :out)}})
+          (binding [*out* *err*]
+            (println (.getMessage ex))
+            (when-let [err (:err data)]
+              (when-not (str/blank? err)
+                (println err)))
+            (when (= :usage (:type data))
+              (println)
+              (println (usage)))))
+        (System/exit exit-code)))))

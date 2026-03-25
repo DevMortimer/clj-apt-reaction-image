@@ -1,6 +1,8 @@
 .cpcache/
 .cache/
 .bin/
-.maymay-reactor/
+.clj-apt-reaction-image/
+datasets/
 target/
-
+mac/*/.build/
+mac/*/.swiftpm/

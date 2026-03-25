@@ -75,6 +75,15 @@ Query with typed text:
 clojure -M:run query --text "bro what" --images-dir "/path/to/images"
 ```
 
+Machine-readable query output for app integrations:
+
+```bash
+clojure -M:run query \
+  --text "bro what" \
+  --images-dir "/path/to/images" \
+  --output json
+```
+
 Override models:
 
 ```bash
@@ -93,6 +102,29 @@ Run:
 ```bash
 clojure -M:test
 ```
+
+## macOS App Prototype
+
+A native SwiftUI shell now lives in `mac/CljAptReactionImageMac`.
+
+Open it in Xcode:
+
+```bash
+open mac/CljAptReactionImageMac/Package.swift
+```
+
+Or build it from the terminal:
+
+```bash
+swift build --package-path mac/CljAptReactionImageMac
+```
+
+The current app shell supports:
+
+- text query input
+- native result cards for ranked reaction images
+- configurable backend root and dataset directory
+- subprocess calls into the Clojure backend over `--output json`
 
 Current tests cover:
 
