@@ -112,6 +112,9 @@
                        :err err})))
     out))
 
+(defn- command-exists? [name]
+  (zero? (:exit (sh/sh "which" name))))
+
 (defn- ocr-image! [image-path]
   (normalize-text
    (command! "tesseract" image-path "stdout" "--psm" "6")))
@@ -239,12 +242,32 @@
     (if (.exists target-file)
       target
       (do
-        (command! "sips"
-                  "-s" "format" "jpeg"
-                  "-s" "formatOptions" "70"
-                  "-Z" (str (:vision-max-side config))
-                  source
-                  "--out" target)
+        (cond
+          (command-exists? "sips")
+          (command! "sips"
+                    "-s" "format" "jpeg"
+                    "-s" "formatOptions" "70"
+                    "-Z" (str (:vision-max-side config))
+                    source
+                    "--out" target)
+
+          (command-exists? "python3")
+          (command! "python3" "-c"
+                    (str
+                     "from PIL import Image, ImageOps; "
+                     "import sys; "
+                     "src, dst, max_side = sys.argv[1], sys.argv[2], int(sys.argv[3]); "
+                     "img = Image.open(src); "
+                     "img = ImageOps.exif_transpose(img).convert('RGB'); "
+                     "img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS); "
+                     "img.save(dst, format='JPEG', quality=70, optimize=True)")
+                    source
+                    target
+                    (str (:vision-max-side config)))
+
+          :else
+          (throw (ex-info "No supported image resize tool found. Install python3 with Pillow or use macOS sips."
+                          {:source source})))
         target))))
 
 (defn- normalize-semantic-payload [image-file payload ocr-text config]
