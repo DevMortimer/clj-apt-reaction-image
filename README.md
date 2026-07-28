@@ -5,6 +5,8 @@ Apple's built-in Vision and Foundation Models.
 
 No cloud. No API keys. No Ollama. 100% on-device.
 
+Tested on my M5 MacBook on 400+ images. Works.
+
 ## What it does
 
 Walks a directory of images, then for each one:
