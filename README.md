@@ -1,161 +1,110 @@
 # clj-apt-reaction-image
 
-Local-first reaction image retrieval for macOS.
+**On-device reaction image organiser** — rename and tag your maymays using
+Apple's built-in Vision and Foundation Models.
 
-The project now has two stages:
+No cloud. No API keys. No Ollama. 100% on-device.
 
-1. Index time:
-   each image is analyzed once and stored as structured metadata.
-2. Query time:
-   typed text is first expanded into reaction intent/tags, then matched against that metadata, then a rerank model picks the best reaction image from the shortlist.
+## What it does
+
+Walks a directory of images, then for each one:
+
+1. **OCR** — extracts visible text (`auge --ocr`)
+2. **Classify** — identifies objects in the scene (`auge --classify`)
+3. **Detect** — counts faces (`auge --faces`)
+4. **Tag** — generates Finder tags for Spotlight search (`apfel-tag`)
+5. **Rename** — creates a short kebab-case filename (`apfel`)
+6. **Apply** — renames the file and sets Finder tags
+
+```bash
+# Before:     distracted-bf.jpg   doge.jpg   screenshot.png
+# After:      people-adult-clothing-jacket-c.jpg  corgi-dog.jpg  telegram-edit-view-window.png
+```
 
 ## Requirements
 
-- macOS
-- `clojure`
-- `tesseract`
-- `ollama`
+- macOS 26+ (Tahoe) on Apple Silicon
+- [Homebrew](https://brew.sh)
+- Apple Intelligence enabled in System Settings
 
-Recommended Ollama model setup:
+## Install
 
 ```bash
-ollama pull qwen2.5vl:3b
+# Install on-device tools
+make install
+
+# Compile the Finder-tag helper
+make compile
 ```
-
-Defaults:
-
-- vision model: `qwen2.5vl:3b`
-- rank model: same as the vision model unless overridden
-- vision max side: `512`
-- checkpoint every: `10` changed images
-- host: `OLLAMA_HOST` or `http://localhost:11434`
-
-## Indexed Shape
-
-Each image is stored with metadata similar to:
-
-```json
-{
-  "id": "HZgWYgWDCFgYDAF1IN1pQEgY.jpg",
-  "caption": "long screenshot of a forum post about Emacs",
-  "reaction_tags": ["rant", "nerdy", "overexplaining", "argumentative"],
-  "scene_tags": ["screenshot", "text-heavy", "forum"],
-  "visible_text": "Emacs ...",
-  "people": [],
-  "emotions": ["frustrated", "smug"],
-  "notes": "works as a reaction to long-winded technical arguments"
-}
-```
-
-`id` is always the image filename including its extension.
-
-## Behavior
-
-- The first build is slow because it creates the semantic index.
-- Before each semantic call, the app resizes the image for vision inference instead of sending the full original file.
-- The index is stored at `.clj-apt-reaction-image/index.edn`.
-- The index is checkpointed during long runs so partial progress is written to disk.
-- On later runs, the app checks the indexed `images-dir` automatically.
-- Only new files or files whose size / modification time changed are reprocessed.
-- Removed files disappear from the refreshed index.
-- OCR is still stored, but it is now only one signal among several.
-- Ollama requests keep the model warm for longer so large indexing runs do not repeatedly cold-start.
 
 ## Usage
 
-Build or refresh the index:
+**Dry run** (preview changes without touching files):
 
 ```bash
-clojure -M:run index --images-dir "/path/to/images"
+make run IMAGES_DIR="~/iCloud/Pictures/maymays" ARGS="--dry-run"
 ```
 
-Query with typed text:
+**Actually rename and tag**:
 
 ```bash
-clojure -M:run query --text "bro what" --images-dir "/path/to/images"
+make run IMAGES_DIR="~/iCloud/Pictures/maymays"
 ```
 
-Query with a screenshot or pasted image saved to disk:
+Or run directly with Clojure:
 
 ```bash
-clojure -M:run query --image "/path/to/chat-screenshot.png" --images-dir "/path/to/images"
+clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --dry-run
 ```
 
-Machine-readable query output for app integrations:
+**JSON output** for scripting:
 
 ```bash
-clojure -M:run query \
-  --text "bro what" \
-  --images-dir "/path/to/images" \
-  --output json
+clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --output json --dry-run
 ```
 
-Machine-readable screenshot query output:
+## How it works
 
-```bash
-clojure -M:run query \
-  --image "/path/to/chat-screenshot.png" \
-  --images-dir "/path/to/images" \
-  --output json
-```
+| Step | Tool | What it produces |
+|---|---|---|
+| OCR | `auge --ocr` | visible text from the image |
+| Classification | `auge --classify` | object/scene labels (top 5) |
+| Face detection | `auge --faces` | number of faces |
+| Content tagging | `apfel-tag` | Finder tags for search |
+| Smart naming | `apfel` (Apple Foundation Model) | short kebab-case filename |
+| Set tags | `mac/tags/main.swift` | writes Finder tags via xattr |
 
-Override models:
-
-```bash
-clojure -M:run index \
-  --images-dir "/path/to/images" \
-  --vision-model "qwen2.5vl:3b" \
-  --rank-model "qwen2.5vl:3b" \
-  --vision-max-side "512" \
-  --checkpoint-every "10"
-```
+All tools run Apple's on-device frameworks — Vision (`VNRecognizeTextRequest`,
+`VNClassifyImageRequest`, `VNDetectFaceRectanglesRequest`) and FoundationModels.
 
 ## Tests
 
-Run:
-
 ```bash
-clojure -M:test
+make test
+# or: clojure -M:test
 ```
 
-## macOS App Prototype
+## Project structure
 
-A native SwiftUI shell now lives in `mac/CljAptReactionImageMac`.
-
-Open it in Xcode:
-
-```bash
-open mac/CljAptReactionImageMac/Package.swift
+```
+├── Makefile                     — install, compile, run, test
+├── deps.edn                    — Clojure deps (just data.json)
+├── src/
+│   └── clj_apt_reaction_image/
+│       └── core.clj            — pipeline orchestrator
+├── mac/
+│   └── tags/
+│       └── main.swift          — Finder tag helper
+└── test/
+    └── clj_apt_reaction_image/
+        └── core_test.clj       — unit tests
 ```
 
-Or build it from the terminal:
+## Caveats
 
-```bash
-swift build --package-path mac/CljAptReactionImageMac
-```
-
-The current app shell supports:
-
-- text query input
-- image query input from file chooser
-- image query input from clipboard paste
-- image query input from drag and drop
-- native result cards for ranked reaction images
-- native result actions for copy, reveal in Finder, and open
-- configurable backend root and dataset directory
-- subprocess calls into the Clojure backend over `--output json`
-
-For image queries, the backend now keeps the screenshot as visual context through ranking, and if direct image-query analysis is weak it falls back to semantic image metadata instead of OCR-only junk.
-
-Current tests cover:
-
-- semantic search-text construction
-- unchanged-file reuse
-- changed-file reprocessing
-- lexical shortlist behavior over semantic metadata
-
-## Next
-
-- screenshot input
-- clipboard image input
-- stronger shortlist retrieval beyond lexical metadata matching
+- **Apple Intelligence must be enabled** in System Settings for `apfel` and `apfel-tag`.
+- **Safety guardrails** on Apple's Foundation Model may block images with people,
+  falling back to label-based naming.
+- Images with visible text (screenshots, memes, chat images) get the best filenames.
+- Plain reaction images without text get descriptive-but-generic names from
+  classification labels.
