@@ -8,8 +8,14 @@
 
 ;; ─── constants ──────────────────────────────────────────────────────────────
 
+(def ^:private still-extensions
+  #{"png" "jpg" "jpeg" "webp" "heic" "heif" "bmp" "tif" "tiff"})
+
+(def ^:private clip-extensions
+  #{"gif" "mp4" "mov" "m4v" "webm" "mkv"})
+
 (def ^:private supported-extensions
-  #{"png" "jpg" "jpeg" "gif" "webp" "heic" "heif" "bmp" "tif" "tiff"})
+  (into still-extensions clip-extensions))
 
 (def ^:private project-dir
   (.getCanonicalFile (io/file ".")))
@@ -31,7 +37,7 @@
    ["clj-apt-reaction-image  —  on-device reaction image organiser"
     ""
     "Commands:"
-    "  organize --images-dir PATH [--dry-run] [--output text|json]"
+    "  organize --images-dir PATH [--dry-run] [--frames N] [--output text|json]"
     ""
     "Examples:"
     "  clojure -M:run organize --images-dir \"~/iCloud/Pictures/maymays\" --dry-run"
@@ -41,6 +47,7 @@
     "  auge       — Apple Vision CLI (OCR, classification, face detection)"
     "  apfel      — Apple Foundation Model CLI (text reasoning)"
     "  apfel-tag  — Apple on-device content tagger"
+    "  ffmpeg     — frame extraction for clips (GIFs and videos)"
     ""
     "All processing is 100% on-device. No cloud, no API keys, no Ollama."]))
 
@@ -57,12 +64,15 @@
     (when (pos? dot)
       (str/lower-case (subs name (inc dot))))))
 
-(defn- image-file? [^java.io.File file]
+(defn- media-file? [^java.io.File file]
   (and (.isFile file) (contains? supported-extensions (extension-of file))))
+
+(defn- clip-file? [^java.io.File file]
+  (contains? clip-extensions (extension-of file)))
 
 (defn- collect-images [images-dir]
   (->> (file-seq (io/file images-dir))
-       (filter image-file?)
+       (filter media-file?)
        (sort-by #(.getAbsolutePath ^java.io.File %))
        vec))
 
@@ -134,13 +144,106 @@
       (log! nil "Tags binary compiled."))))
 
 (defn- ensure-prerequisites! []
-  (doseq [tool ["auge" "apfel" "apfel-tag"]]
+  (doseq [tool ["auge" "apfel" "apfel-tag" "ffmpeg" "ffprobe"]]
     (when-not (command-exists? tool)
       (throw (ex-info (str "Missing required tool: " tool
-                           ". Install with: brew install " (if (= tool "auge") "Arthur-Ficial/tap/auge" tool))
+                           ". Install with: brew install "
+                           (case tool
+                             "auge" "Arthur-Ficial/tap/auge"
+                             "ffmpeg" "ffmpeg"
+                             "ffprobe" "ffmpeg"
+                             tool))
                       {:tool tool}))))
   (ensure-tags-binary!)
   true)
+
+;; ─── frame sampling ────────────────────────────────────────────────────────
+
+(defn- sample-fractions [n]
+  ;; n evenly spaced, centered: n=6 → 1/12, 3/12, 5/12, 7/12, 9/12, 11/12
+  (mapv #(/ (+ 1.0 (* 2 %)) (* 2 n)) (range n)))
+
+(defn- clip-duration! [path]
+  (try
+    (let [stdout (:out (sh/sh "ffprobe" "-v" "error"
+                              "-show_entries" "format=duration"
+                              "-of" "default=noprint_wrappers=1:nokey=1" path))
+          parsed (Double/parseDouble (str/trim stdout))]
+      (when (pos? parsed) parsed))
+    (catch Exception _ nil)))
+
+(defn- extract-frames! [path n]
+  (let [temp-dir (.toFile (java.nio.file.Files/createTempDirectory
+                           "clj-apt-frames"
+                           (make-array java.nio.file.attribute.FileAttribute 0)))
+        duration (clip-duration! path)
+        timestamps (if duration
+                     (mapv #(* duration %) (sample-fractions n))
+                     [0.0])]
+    (try
+      (doseq [[i t] (map-indexed vector timestamps)]
+        (sh/sh "ffmpeg" "-v" "error" "-ss" (format "%.3f" t)
+               "-i" path "-frames:v" "1"
+               "-y" (str (.getAbsolutePath temp-dir) "/frame-" (format "%03d" i) ".png")))
+      (let [frame-files (->> (.listFiles temp-dir)
+                             (filter #(and (.isFile %) (pos? (.length %))))
+                             sort
+                             vec)
+            digest (java.security.MessageDigest/getInstance "MD5")
+            seen (atom #{})
+            deduped (filterv (fn [^java.io.File f]
+                               (let [bytes (java.nio.file.Files/readAllBytes (.toPath f))
+                                     hash (format "%032x" (BigInteger. 1 (.digest digest bytes)))]
+                                 (.reset digest)
+                                 (when-not (@seen hash)
+                                   (swap! seen conj hash)
+                                   true)))
+                             frame-files)]
+        {:dir temp-dir :frames deduped})
+      (catch Exception e
+        {:dir temp-dir :frames []}))))
+
+;; ─── auge batch ─────────────────────────────────────────────────────────────
+
+(defn- auge-batch! [mode paths]
+  (try
+    (let [result (sh/sh "auge" mode "--ndjson" "-q" :in (str/join "\n" (map str paths)))]
+      (if (zero? (:exit result))
+        (let [lines (str/split-lines (str/trim (:out result)))]
+          (into {} (for [line lines
+                         :when (not (str/blank? line))]
+                     (let [parsed (json/read-str line :key-fn keyword)]
+                       [(:file parsed) parsed]))))
+        {}))
+    (catch Exception _ {})))
+
+;; ─── frame merge ────────────────────────────────────────────────────────────
+
+(defn- merge-ocr-texts [texts]
+  (let [seen (atom #{})]
+    (->> texts
+         (map normalize-text)
+         (remove str/blank?)
+         (filter (fn [t]
+                   (let [low (str/lower-case t)]
+                     (when-not (@seen low)
+                       (swap! seen conj low)
+                       true))))
+         (str/join " "))))
+
+(defn- merge-classifications [per-frame-classifications]
+  (let [best (->> (flatten (seq per-frame-classifications))
+                  (remove nil?)
+                  (group-by #(str/lower-case (name (:label %))))
+                  (mapv (fn [[_ items]]
+                          (apply max-key :confidence items)))
+                  (sort-by #(- (:confidence %)))
+                  (take 5)
+                  (map #(name (:label %))))]
+    (str/join ", " best)))
+
+(defn- merge-face-counts [counts]
+  (reduce max 0 counts))
 
 ;; ─── auge extraction ────────────────────────────────────────────────────────
 
@@ -266,6 +369,46 @@
         (throw (ex-info "Failed to set Finder tags"
                         {:file file-path :tags tags-str :error err}))))))
 
+;; ─── describe seam ──────────────────────────────────────────────────────────
+
+(defn- describe-still! [path]
+  {:ocr-text (extract-ocr! path)
+   :classes  (extract-classes! path)
+   :faces    (extract-faces! path)})
+
+(defn- describe-clip! [config path]
+  (let [n (:frames config)
+        {:keys [dir frames]} (extract-frames! path n)]
+    (try
+      (if (empty? frames)
+        (do
+          (log! config (str "  no frames extracted, falling back to still analysis"))
+          (describe-still! path))
+        (let [frame-paths (mapv #(.getAbsolutePath ^java.io.File %) frames)]
+          (log! config (str "  frames: " (count frames) " sampled"))
+          (let [ocr-batch (auge-batch! "--ocr" frame-paths)
+                classify-batch (auge-batch! "--classify" frame-paths)
+                faces-batch (auge-batch! "--faces" frame-paths)
+                ocr-texts (mapv (fn [fp]
+                                  (-> (get ocr-batch fp)
+                                      :results :text normalize-text))
+                                frame-paths)
+                classifications (mapv (fn [fp]
+                                        (-> (get classify-batch fp)
+                                            :results :classifications (or [])))
+                                      frame-paths)
+                face-counts (mapv (fn [fp]
+                                    (-> (get faces-batch fp)
+                                        :results :count (or 0)))
+                                  frame-paths)]
+            {:ocr-text (merge-ocr-texts ocr-texts)
+             :classes  (merge-classifications classifications)
+             :faces    (merge-face-counts face-counts)})))
+      (finally
+        (doseq [f (.listFiles dir)]
+          (io/delete-file f :silently))
+        (io/delete-file dir :silently)))))
+
 ;; ─── per-image pipeline ─────────────────────────────────────────────────────
 
 (defn- process-image! [config ^java.io.File image-file timestamp]
@@ -274,15 +417,16 @@
         ext (extension-of image-file)
         dry-run (:dry-run config)]
     (log! config (str "[" timestamp "] " name))
-    (let [ocr-text (extract-ocr! path)
+    (let [{:keys [ocr-text classes faces]}
+          (if (clip-file? image-file)
+            (describe-clip! config path)
+            (describe-still! path))
           _ (log! config (str "  ocr: " (when (seq ocr-text) (str (subs ocr-text 0 (min 60 (count ocr-text))) "..."))))
-          classes (extract-classes! path)
           _ (log! config (str "  classes: " classes))
-          face-count (extract-faces! path)
-          _ (log! config (str "  faces: " face-count))
+          _ (log! config (str "  faces: " faces))
           tags (generate-tags! ocr-text classes)
           _ (log! config (str "  tags: " tags))
-          raw-name (generate-filename! ocr-text classes face-count tags)
+          raw-name (generate-filename! ocr-text classes faces tags)
           clean-name (sanitize-filename raw-name 30)
           final-name (if (str/blank? clean-name)
                        (str "img-" (System/currentTimeMillis))
@@ -305,15 +449,27 @@
        :tags tags
        :ocr-text ocr-text
        :classes classes
-       :faces face-count
+       :faces faces
        :dry-run dry-run})))
 
 ;; ─── organise command ──────────────────────────────────────────────────────
 
 (defn- default-config [opts]
-  {:images-dir (some-> (:images-dir opts) canonical-path)
-   :dry-run (boolean (:dry-run opts))
-   :output-format (or (:output opts) "text")})
+  (let [parse-frames
+        (fn [s]
+          (try
+            (let [n (Integer/parseInt s)]
+              (if (pos? n) n
+                  (throw (ex-info "Invalid --frames: must be a positive integer"
+                                  {:type :usage :exit-code 1}))))
+            (catch NumberFormatException _
+              (throw (ex-info "Invalid --frames: must be a positive integer"
+                              {:type :usage :exit-code 1})))))
+        frames-str (:frames opts)]
+    {:images-dir (some-> (:images-dir opts) canonical-path)
+     :dry-run (boolean (:dry-run opts))
+     :frames (if frames-str (parse-frames frames-str) 6)
+     :output-format (or (:output opts) "text")}))
 
 (defn organize-images! [config]
   (ensure-prerequisites!)

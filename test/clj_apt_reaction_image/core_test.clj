@@ -36,16 +36,17 @@
 (deftest image-file-detects-supported-extensions
   (with-temp-dir
    (fn [dir]
-     (doseq [ext ["jpg" "jpeg" "png" "gif" "webp" "heic" "heif" "bmp" "tif" "tiff"]]
+     (doseq [ext ["jpg" "jpeg" "png" "gif" "webp" "heic" "heif" "bmp" "tif" "tiff"
+                   "mp4" "mov" "m4v" "webm" "mkv"]]
        (let [f (write-file! dir (str "test." ext) "data")]
-         (is (#'core/image-file? f) (str "should accept ." ext)))))))
+         (is (#'core/media-file? f) (str "should accept ." ext)))))))
 
 (deftest image-file-rejects-unsupported-extensions
   (with-temp-dir
    (fn [dir]
-     (doseq [ext ["txt" "md" "pdf" "mp4" "mov" "mp3" "" "svg"]]
+     (doseq [ext ["txt" "md" "pdf" "mp3" "" "svg"]]
        (let [f (write-file! dir (str "test." ext) "data")]
-         (is (not (#'core/image-file? f)) (str "should reject ." ext)))))))
+         (is (not (#'core/media-file? f)) (str "should reject ." ext)))))))
 
 ;; ─── collect-images ────────────────────────────────────────────────────────
 
@@ -132,12 +133,94 @@
   (is (= "" (#'core/normalize-text nil)))
   (is (= "" (#'core/normalize-text ""))))
 
+;; ─── clip-file? ───────────────────────────────────────────────────────────
+
+(deftest clip-file-detects-clips
+  (doseq [ext ["gif" "mp4" "mov" "m4v" "webm" "mkv"]]
+    (is (#'core/clip-file? (io/file (str "test." ext)))
+        (str "should accept ." ext))))
+
+(deftest clip-file-rejects-stills
+  (doseq [ext ["png" "jpg" "txt"]]
+    (is (not (#'core/clip-file? (io/file (str "test." ext))))
+        (str "should reject ." ext))))
+
+;; ─── sample-fractions ─────────────────────────────────────────────────────
+
+(deftest sample-fractions-n6
+  (let [fractions (#'core/sample-fractions 6)]
+    (is (= 6 (count fractions)))
+    (is (< 0 (first fractions) 1))
+    (is (< 0 (last fractions) 1))
+    (is (= (sort fractions) fractions) "ascending")
+    (is (< (Math/abs (- (first fractions) (/ 1 12))) 1e-9))
+    (is (< (Math/abs (- (last fractions) (/ 11 12))) 1e-9))))
+
+(deftest sample-fractions-n1
+  (let [fractions (#'core/sample-fractions 1)]
+    (is (= 1 (count fractions)))
+    (is (< (Math/abs (- (first fractions) 0.5)) 1e-9))))
+
+;; ─── merge-ocr-texts ──────────────────────────────────────────────────────
+
+(deftest merge-ocr-texts-dedupes-order-preserving
+  (is (= "lol boom" (#'core/merge-ocr-texts ["lol" "lol" "boom"])))
+  (is (= "hi" (#'core/merge-ocr-texts ["" "hi" nil])))
+  (is (= "Hey" (#'core/merge-ocr-texts ["Hey" "hey"])))
+  (is (= "" (#'core/merge-ocr-texts []))))
+
+;; ─── merge-classifications ────────────────────────────────────────────────
+
+(deftest merge-classifications-groups-by-label
+  (let [result (#'core/merge-classifications
+                [[{:label "cat" :confidence 0.9}]
+                 [{:label "cat" :confidence 0.5} {:label "dog" :confidence 0.7}]])]
+    (is (= "cat, dog" result)))
+  (is (= "" (#'core/merge-classifications [])))
+  (is (= "" (#'core/merge-classifications [[] []]))))
+
+(deftest merge-classifications-caps-at-five
+  (let [many (vec (for [i (range 10)] [{:label (str "l" i) :confidence 0.5}]))
+        result (#'core/merge-classifications many)]
+    (is (= 5 (count (str/split result #", "))))))
+
+(deftest merge-classifications-handles-nil-entries
+  (is (= "cat" (#'core/merge-classifications [nil [{:label "cat" :confidence 0.9}]])))
+  (is (= "" (#'core/merge-classifications [nil nil]))))
+
+;; ─── merge-face-counts ────────────────────────────────────────────────────
+
+(deftest merge-face-counts-takes-max
+  (is (= 2 (#'core/merge-face-counts [0 2 1])))
+  (is (= 0 (#'core/merge-face-counts [])))
+  (is (= 5 (#'core/merge-face-counts [1 5 3]))))
+
+;; ─── frames config ────────────────────────────────────────────────────────
+
+(deftest parse-args-extracts-frames
+  (let [result (#'core/parse-args ["--frames" "8"])]
+    (is (= "8" (:frames result)))))
+
+(deftest default-config-defaults-frames-to-6
+  (is (= 6 (:frames (#'core/default-config {})))))
+
+(deftest default-config-parses-frames
+  (is (= 3 (:frames (#'core/default-config {:frames "3"})))))
+
+(deftest default-config-rejects-invalid-frames
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"Invalid --frames"
+       (#'core/default-config {:frames "abc"})))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"Invalid --frames"
+       (#'core/default-config {:frames "0"}))))
+
 ;; ─── entry point ──────────────────────────────────────────────────────────
 
 (deftest usage-is-printed-on-help
-  (let [output (with-out-str
-                 (println (#'core/usage)))]
-    (is (str/includes? output "organize"))))
+  (let [output (#'core/usage)]
+    (is (str/includes? output "organize"))
+    (is (str/includes? output "--frames"))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]

@@ -9,14 +9,15 @@ Tested on my M5 MacBook on 400+ images. Works.
 
 ## What it does
 
-Walks a directory of images, then for each one:
+Walks a directory of images and clips (GIFs, mp4/mov/m4v/webm/mkv videos), then for each one:
 
-1. **OCR** — extracts visible text (`auge --ocr`)
-2. **Classify** — identifies objects in the scene (`auge --classify`)
-3. **Detect** — counts faces (`auge --faces`)
-4. **Tag** — generates Finder tags for Spotlight search (`apfel-tag`)
-5. **Rename** — creates a short kebab-case filename (`apfel`)
-6. **Apply** — renames the file and sets Finder tags
+1. **Frame sampling** — ffmpeg extracts N still frames for analysis (clips only; default 6)
+2. **OCR** — extracts visible text (`auge --ocr`)
+3. **Classify** — identifies objects in the scene (`auge --classify`)
+4. **Detect** — counts faces (`auge --faces`)
+5. **Tag** — generates Finder tags for Spotlight search (`apfel-tag`)
+6. **Rename** — creates a short kebab-case filename (`apfel`)
+7. **Apply** — renames the file and sets Finder tags
 
 ```bash
 # Before:     distracted-bf.jpg   doge.jpg   screenshot.png
@@ -65,10 +66,17 @@ clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --dry-run
 clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --output json --dry-run
 ```
 
+**More frames for dense clips:**
+
+```bash
+clojure -M:run organize --images-dir "~/iCloud/Videos/gifs" --frames 12 --dry-run
+```
+
 ## How it works
 
 | Step | Tool | What it produces |
 |---|---|---|
+| Frame sampling | `ffmpeg` | N still frames from each clip (default 6) |
 | OCR | `auge --ocr` | visible text from the image |
 | Classification | `auge --classify` | object/scene labels (top 5) |
 | Face detection | `auge --faces` | number of faces |
@@ -110,3 +118,7 @@ make test
 - Images with visible text (screenshots, memes, chat images) get the best filenames.
 - Plain reaction images without text get descriptive-but-generic names from
   classification labels.
+- Clips are judged by sampled frames only — a punchline that appears between
+  samples can be missed (raise `--frames` for dense clips).
+- webm and mkv have no native macOS support and are handled entirely through
+  ffmpeg frame extraction.

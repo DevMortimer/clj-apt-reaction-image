@@ -20,6 +20,7 @@ install:
 	$(INSTALL) Arthur-Ficial/tap/auge
 	$(INSTALL) apfel
 	$(INSTALL) Arthur-Ficial/tap/apfel-tag
+	$(INSTALL) ffmpeg
 
 compile:
 	mkdir -p .clj-apt-reaction-image
