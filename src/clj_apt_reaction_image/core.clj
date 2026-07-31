@@ -37,11 +37,15 @@
    ["clj-apt-reaction-image  —  on-device reaction image organiser"
     ""
     "Commands:"
-    "  organize --images-dir PATH [--dry-run] [--frames N] [--output text|json]"
+    "  organize --images-dir PATH [--dry-run] [--all] [--frames N] [--output text|json]"
+    ""
+    "Files that already carry Finder tags are treated as done and skipped."
+    "Pass -a / --all to reprocess them anyway."
     ""
     "Examples:"
     "  clojure -M:run organize --images-dir \"~/iCloud/Pictures/maymays\" --dry-run"
     "  clojure -M:run organize --images-dir \"~/iCloud/Pictures/maymays\""
+    "  clojure -M:run organize --images-dir \"~/iCloud/Pictures/maymays\" --all"
     ""
     "Dependencies (installed via homebrew):"
     "  auge       — Apple Vision CLI (OCR, classification, face detection)"
@@ -90,11 +94,14 @@
   (.mkdirs dir) dir)
 
 (def ^:private boolean-flags
-  #{"--dry-run" "--dryrun" "--json" "--quiet" "--help" "--version"})
+  #{"--dry-run" "--dryrun" "--json" "--quiet" "--help" "--version" "--all"})
+
+(def ^:private flag-aliases
+  {"-a" "--all"})
 
 (defn- parse-args [argv]
   (loop [args argv parsed {:positionals []}]
-    (if-let [arg (first args)]
+    (if-let [arg (get flag-aliases (first args) (first args))]
       (if (str/starts-with? arg "--")
         (if (contains? boolean-flags arg)
           (recur (next args) (assoc parsed (keyword (subs arg 2)) true))
@@ -130,7 +137,8 @@
 ;; ─── prerequisite checks ────────────────────────────────────────────────────
 
 (defn- ensure-tags-binary! []
-  (when-not (.exists tags-binary)
+  (when (or (not (.exists tags-binary))
+            (> (.lastModified tags-source) (.lastModified tags-binary)))
     (log! nil "Compiling tags binary...")
     (ensure-dir! (.getParentFile tags-binary))
     (let [{:keys [exit out err]}
@@ -376,6 +384,17 @@
 
 ;; ─── finder tags ────────────────────────────────────────────────────────────
 
+(defn- finder-tags! [file-path]
+  (let [{:keys [exit out]} (sh/sh (.getAbsolutePath tags-binary) file-path)]
+    (if (zero? exit)
+      (->> (str/split (str/trim out) #",")
+           (remove str/blank?)
+           vec)
+      [])))
+
+(defn- already-tagged? [^java.io.File file]
+  (boolean (seq (finder-tags! (.getAbsolutePath file)))))
+
 (defn- set-finder-tags! [file-path tags-str]
   (when (and (seq tags-str) (.exists (io/file file-path)))
     (let [{:keys [exit err]} (sh/sh (.getAbsolutePath tags-binary)
@@ -484,6 +503,7 @@
         frames-str (:frames opts)]
     {:images-dir (some-> (:images-dir opts) canonical-path)
      :dry-run (boolean (:dry-run opts))
+     :all (boolean (:all opts))
      :frames (if frames-str (parse-frames frames-str) 6)
      :output-format (or (:output opts) "text")}))
 
@@ -493,21 +513,37 @@
     (when-not images-dir
       (throw (ex-info "Provide --images-dir"
                       {:type :usage :exit-code 1})))
-    (let [images (collect-images images-dir)
-          total (count images)]
-      (when (zero? total)
+    (let [all-files (collect-images images-dir)]
+      (when (zero? (count all-files))
         (throw (ex-info "No supported image files found" {:images-dir images-dir})))
-      (log! config (str "Processing " total " images in " images-dir))
-      (let [results (mapv (fn [^java.io.File img]
-                            (let [idx (inc (.indexOf images img))
-                                  ts (str idx "/" total)]
-                              (process-image! config img ts)))
-                          images)]
-        (log! config (str "Done. " total " images processed."))
-        {:images-dir images-dir
-         :dry-run (:dry-run config)
-         :total total
-         :results results}))))
+      (let [images (if (:all config)
+                     all-files
+                     (vec (remove already-tagged? all-files)))
+            skipped (- (count all-files) (count images))
+            total (count images)]
+        (when (pos? skipped)
+          (log! config (str "Skipping " skipped " already-tagged file(s); pass --all to reprocess.")))
+        (if (zero? total)
+          (do
+            (log! config "Nothing to do.")
+            {:images-dir images-dir
+             :dry-run (:dry-run config)
+             :total 0
+             :skipped skipped
+             :results []})
+          (do
+            (log! config (str "Processing " total " images in " images-dir))
+            (let [results (mapv (fn [^java.io.File img]
+                                  (let [idx (inc (.indexOf images img))
+                                        ts (str idx "/" total)]
+                                    (process-image! config img ts)))
+                                images)]
+              (log! config (str "Done. " total " images processed."))
+              {:images-dir images-dir
+               :dry-run (:dry-run config)
+               :total total
+               :skipped skipped
+               :results results})))))))
 
 ;; ─── output ─────────────────────────────────────────────────────────────────
 
@@ -530,6 +566,7 @@
   {:images_dir (:images-dir result)
    :dry_run (:dry-run result)
    :total (:total result)
+   :skipped (:skipped result 0)
    :results (mapv entry->response (:results result))})
 
 ;; ─── CLI entry points ───────────────────────────────────────────────────────

@@ -151,6 +151,15 @@
        clojure.lang.ExceptionInfo #"Missing value"
        (#'core/parse-args ["--images-dir"]))))
 
+(deftest parse-args-extracts-all-flag
+  (is (true? (:all (#'core/parse-args ["--all"]))))
+  (is (true? (:all (#'core/parse-args ["-a"]))))
+  (is (nil? (:all (#'core/parse-args ["--images-dir" "/path"])))))
+
+(deftest default-config-all-defaults-to-false
+  (is (false? (:all (#'core/default-config {}))))
+  (is (true? (:all (#'core/default-config {:all true})))))
+
 ;; ─── command-exists? ───────────────────────────────────────────────────────
 
 (deftest command-exists-detects-present-command

@@ -60,6 +60,14 @@ Or run directly with Clojure:
 clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --dry-run
 ```
 
+**Re-runs skip finished files.** A file that already carries Finder tags is
+treated as categorized and skipped, so re-running on the same directory only
+picks up new additions. Force a full reprocess with `-a` / `--all`:
+
+```bash
+clojure -M:run organize --images-dir "~/iCloud/Pictures/maymays" --all
+```
+
 **JSON output** for scripting:
 
 ```bash
@@ -82,7 +90,7 @@ clojure -M:run organize --images-dir "~/iCloud/Videos/gifs" --frames 12 --dry-ru
 | Face detection | `auge --faces` | number of faces |
 | Content tagging | `apfel-tag` | Finder tags for search |
 | Smart naming | `apfel` (Apple Foundation Model) | short kebab-case filename |
-| Set tags | `mac/tags/main.swift` | writes Finder tags via xattr |
+| Read/set tags | `mac/tags/main.swift` | reads and writes Finder tags via xattr |
 
 All tools run Apple's on-device frameworks — Vision (`VNRecognizeTextRequest`,
 `VNClassifyImageRequest`, `VNDetectFaceRectanglesRequest`) and FoundationModels.
