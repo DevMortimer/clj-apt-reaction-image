@@ -100,6 +100,40 @@
 (deftest sanitize-filename-never-produces-dot
   (is (not (str/includes? (#'core/sanitize-filename "file.name.with.dots" 30) "."))))
 
+;; ─── unique-target ─────────────────────────────────────────────────────────
+
+(deftest unique-target-returns-name-when-free
+  (with-temp-dir
+   (fn [dir]
+     (let [source (write-file! dir "original.jpg" "data")
+           target (#'core/unique-target source "cat-meme" "jpg")]
+       (is (= "cat-meme.jpg" (.getName target)))))))
+
+(deftest unique-target-keeps-own-name
+  (with-temp-dir
+   (fn [dir]
+     (let [source (write-file! dir "cat-meme.jpg" "data")
+           target (#'core/unique-target source "cat-meme" "jpg")]
+       (is (= "cat-meme.jpg" (.getName target)))))))
+
+(deftest unique-target-appends-suffix-when-taken
+  (with-temp-dir
+   (fn [dir]
+     (write-file! dir "cat-meme.jpg" "data")
+     (let [source (write-file! dir "original.jpg" "data")
+           target (#'core/unique-target source "cat-meme" "jpg")]
+       (is (= "cat-meme_1.jpg" (.getName target)))))))
+
+(deftest unique-target-increments-past-existing-suffixes
+  (with-temp-dir
+   (fn [dir]
+     (write-file! dir "cat-meme.jpg" "data")
+     (write-file! dir "cat-meme_1.jpg" "data")
+     (write-file! dir "cat-meme_2.jpg" "data")
+     (let [source (write-file! dir "original.jpg" "data")
+           target (#'core/unique-target source "cat-meme" "jpg")]
+       (is (= "cat-meme_3.jpg" (.getName target)))))))
+
 ;; ─── parse-args ────────────────────────────────────────────────────────────
 
 (deftest parse-args-extracts-flags

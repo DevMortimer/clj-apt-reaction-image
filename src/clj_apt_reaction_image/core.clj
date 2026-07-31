@@ -359,6 +359,21 @@
                     (str/replace #"^-|-$" ""))]
     (subs cleaned 0 (min max-len (count cleaned)))))
 
+(defn- unique-target
+  "Target file for renaming source to base.ext in its directory. When a
+  different file already has that name, appends _1, _2, ... until free."
+  [^java.io.File source base ext]
+  (let [dir (.getParentFile source)
+        candidate (io/file dir (str base "." ext))]
+    (if (or (= (.getAbsolutePath candidate) (.getAbsolutePath source))
+            (not (.exists candidate)))
+      candidate
+      (loop [n 1]
+        (let [c (io/file dir (str base "_" n "." ext))]
+          (if (.exists c)
+            (recur (inc n))
+            c))))))
+
 ;; ─── finder tags ────────────────────────────────────────────────────────────
 
 (defn- set-finder-tags! [file-path tags-str]
@@ -431,9 +446,10 @@
           final-name (if (str/blank? clean-name)
                        (str "img-" (System/currentTimeMillis))
                        clean-name)
-          new-path (.getAbsolutePath (io/file (.getParentFile image-file)
-                                              (str final-name "." ext)))]
-      (log! config (str "  → " final-name "." ext))
+          target (unique-target image-file final-name ext)
+          new-name (.getName target)
+          new-path (.getAbsolutePath target)]
+      (log! config (str "  → " new-name))
       (when dry-run
         (log! config "  (dry-run, no changes made)"))
       (when-not dry-run
@@ -444,7 +460,7 @@
                               {:from path :to new-path})))))
         (set-finder-tags! new-path tags))
       {:original-name name
-       :new-name (str final-name "." ext)
+       :new-name new-name
        :path new-path
        :tags tags
        :ocr-text ocr-text
