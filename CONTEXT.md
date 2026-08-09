@@ -15,7 +15,7 @@ tagging it with macOS Finder tags for search.
 | **kebab-case** | Lowercase filename using hyphens as word separators, no spaces, max 30 chars. |
 | **Finder tags** | macOS extended attribute (`_kMDItemUserTags`) visible as coloured dots in Finder and searchable via Spotlight. |
 | **on-device** | All processing runs locally on the Mac — no network, no cloud, no API keys. Uses Apple's built-in Vision framework and Foundation Models. |
-| **fallback name** | When the LLM can't generate a name (e.g. safety guardrails), construct one from the first classification label + face count + abbreviated OCR text. |
+| **fallback name** | When the LLM can't generate a name (e.g. safety guardrails), construct one from the abbreviated OCR text + face count + first classification label. |
 | **clip** | A moving-picture file — an animated GIF or a video. Organised like a still image, but described via frame sampling. |
 | **frame sampling** | Analysing a clip by extracting N still frames at evenly-spaced fractions of its duration, skipping the very start and end. Deterministic: the same clip always yields the same frames, so a dry-run preview matches the real run. |
 | **frame merge** | Collapsing N sampled frames into the single description the rest of the pipeline expects: OCR text concatenated in temporal order with repeats deduped, class labels unioned and ranked by max confidence, face count taken as the max seen in any one frame. |

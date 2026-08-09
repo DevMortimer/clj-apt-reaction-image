@@ -1,11 +1,12 @@
 (ns clj-apt-reaction-image.core-test
   (:require
+   [clojure.data.json :as json]
    [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is run-tests]]
    [clj-apt-reaction-image.core :as core]))
 
-;; ─── helpers ──────────────────────────────────────────────────────────────
+;; ─── helpers ──────────────────────────────────────────────────────────
 
 (defn- temp-dir []
   (.toFile (java.nio.file.Files/createTempDirectory
@@ -25,30 +26,28 @@
         (doseq [file (.listFiles dir)]
           (io/delete-file file))))))
 
-;; ─── extension / image-file ────────────────────────────────────────────────
+(defn- pipeline-run
+  "Fake runner for the whole organise pipeline: no real tools needed.
+  every external call is answered with canned output."
+  [calls]
+  (fn [args stdin]
+    (swap! calls conj {:args args :stdin stdin})
+    (cond
+      (= "which" (first args)) {:exit 0 :out "/usr/bin/fake" :err ""}
+      (= "swiftc" (first args)) {:exit 0 :out "" :err ""}
+      (str/ends-with? (first args) "/tags") {:exit 0 :out "" :err ""}
+      (= "auge" (first args))
+      (case (second args)
+        "--ocr" {:exit 0 :out (json/write-str {:results {:text "lol"}}) :err ""}
+        "--classify" {:exit 0 :out (json/write-str
+                                     {:results {:classifications [{:label "cat" :confidence 0.9}]}})
+                       :err ""}
+        "--faces" {:exit 0 :out (json/write-str {:results {:count 1}}) :err ""})
+      (= "apfel-tag" (first args)) {:exit 0 :out (json/write-str {:tags ["funny"]}) :err ""}
+      (= "apfel" (first args)) {:exit 0 :out (json/write-str {:name "cat-meme"}) :err ""}
+      :else {:exit 0 :out "" :err ""})))
 
-(deftest extension-of-extracts-lowercase-extension
-  (is (= "jpg" (#'core/extension-of (io/file "cat.jpg"))))
-  (is (= "png" (#'core/extension-of (io/file "screenshot.PNG"))))
-  (is (= "gif" (#'core/extension-of (io/file "reaction.GIF"))))
-  (is (nil? (#'core/extension-of (io/file "noextension")))))
-
-(deftest image-file-detects-supported-extensions
-  (with-temp-dir
-   (fn [dir]
-     (doseq [ext ["jpg" "jpeg" "png" "gif" "webp" "heic" "heif" "bmp" "tif" "tiff"
-                   "mp4" "mov" "m4v" "webm" "mkv"]]
-       (let [f (write-file! dir (str "test." ext) "data")]
-         (is (#'core/media-file? f) (str "should accept ." ext)))))))
-
-(deftest image-file-rejects-unsupported-extensions
-  (with-temp-dir
-   (fn [dir]
-     (doseq [ext ["txt" "md" "pdf" "mp3" "" "svg"]]
-       (let [f (write-file! dir (str "test." ext) "data")]
-         (is (not (#'core/media-file? f)) (str "should reject ." ext)))))))
-
-;; ─── collect-images ────────────────────────────────────────────────────────
+;; ─── collect-images ───────────────────────────────────────────────────
 
 (deftest collect-images-finds-only-images
   (with-temp-dir
@@ -72,7 +71,7 @@
            names (mapv #(.getName ^java.io.File %) images)]
        (is (= ["a.jpg" "m.jpg" "z.jpg"] names))))))
 
-;; ─── sanitize-filename ─────────────────────────────────────────────────────
+;; ─── sanitize-filename ────────────────────────────────────────────────
 
 (deftest sanitize-filename-removes-spaces
   (is (not (str/includes? (#'core/sanitize-filename "hello world test" 30) " ")))
@@ -100,7 +99,7 @@
 (deftest sanitize-filename-never-produces-dot
   (is (not (str/includes? (#'core/sanitize-filename "file.name.with.dots" 30) "."))))
 
-;; ─── unique-target ─────────────────────────────────────────────────────────
+;; ─── unique-target ────────────────────────────────────────────────────
 
 (deftest unique-target-returns-name-when-free
   (with-temp-dir
@@ -134,7 +133,7 @@
            target (#'core/unique-target source "cat-meme" "jpg")]
        (is (= "cat-meme_3.jpg" (.getName target)))))))
 
-;; ─── parse-args ────────────────────────────────────────────────────────────
+;; ─── parse-args ───────────────────────────────────────────────────────
 
 (deftest parse-args-extracts-flags
   (let [result (#'core/parse-args ["--images-dir" "/path" "--dry-run"])]
@@ -160,86 +159,6 @@
   (is (false? (:all (#'core/default-config {}))))
   (is (true? (:all (#'core/default-config {:all true})))))
 
-;; ─── command-exists? ───────────────────────────────────────────────────────
-
-(deftest command-exists-detects-present-command
-  (is (true? (#'core/command-exists? "sh")))
-  (is (true? (#'core/command-exists? "ls"))))
-
-(deftest command-exists-rejects-missing-command
-  (is (false? (#'core/command-exists? "this-command-definitely-does-not-exist-12345"))))
-
-;; ─── normalize-text ────────────────────────────────────────────────────────
-
-(deftest normalize-text-collapses-whitespace
-  (is (= "hello world" (#'core/normalize-text " hello   world ")))
-  (is (= "" (#'core/normalize-text nil)))
-  (is (= "" (#'core/normalize-text ""))))
-
-;; ─── clip-file? ───────────────────────────────────────────────────────────
-
-(deftest clip-file-detects-clips
-  (doseq [ext ["gif" "mp4" "mov" "m4v" "webm" "mkv"]]
-    (is (#'core/clip-file? (io/file (str "test." ext)))
-        (str "should accept ." ext))))
-
-(deftest clip-file-rejects-stills
-  (doseq [ext ["png" "jpg" "txt"]]
-    (is (not (#'core/clip-file? (io/file (str "test." ext))))
-        (str "should reject ." ext))))
-
-;; ─── sample-fractions ─────────────────────────────────────────────────────
-
-(deftest sample-fractions-n6
-  (let [fractions (#'core/sample-fractions 6)]
-    (is (= 6 (count fractions)))
-    (is (< 0 (first fractions) 1))
-    (is (< 0 (last fractions) 1))
-    (is (= (sort fractions) fractions) "ascending")
-    (is (< (Math/abs (- (first fractions) (/ 1 12))) 1e-9))
-    (is (< (Math/abs (- (last fractions) (/ 11 12))) 1e-9))))
-
-(deftest sample-fractions-n1
-  (let [fractions (#'core/sample-fractions 1)]
-    (is (= 1 (count fractions)))
-    (is (< (Math/abs (- (first fractions) 0.5)) 1e-9))))
-
-;; ─── merge-ocr-texts ──────────────────────────────────────────────────────
-
-(deftest merge-ocr-texts-dedupes-order-preserving
-  (is (= "lol boom" (#'core/merge-ocr-texts ["lol" "lol" "boom"])))
-  (is (= "hi" (#'core/merge-ocr-texts ["" "hi" nil])))
-  (is (= "Hey" (#'core/merge-ocr-texts ["Hey" "hey"])))
-  (is (= "" (#'core/merge-ocr-texts []))))
-
-;; ─── merge-classifications ────────────────────────────────────────────────
-
-(deftest merge-classifications-groups-by-label
-  (let [result (#'core/merge-classifications
-                [[{:label "cat" :confidence 0.9}]
-                 [{:label "cat" :confidence 0.5} {:label "dog" :confidence 0.7}]])]
-    (is (= "cat, dog" result)))
-  (is (= "" (#'core/merge-classifications [])))
-  (is (= "" (#'core/merge-classifications [[] []]))))
-
-(deftest merge-classifications-caps-at-five
-  (let [many (vec (for [i (range 10)] [{:label (str "l" i) :confidence 0.5}]))
-        result (#'core/merge-classifications many)]
-    (is (= 5 (count (str/split result #", "))))))
-
-(deftest merge-classifications-handles-nil-entries
-  (is (= "cat" (#'core/merge-classifications [nil [{:label "cat" :confidence 0.9}]])))
-  (is (= "" (#'core/merge-classifications [nil nil]))))
-
-;; ─── merge-face-counts ────────────────────────────────────────────────────
-
-(deftest merge-face-counts-takes-max
-  (is (= 2 (#'core/merge-face-counts [0 2 1])))
-  (is (= 0 (#'core/merge-face-counts [])))
-  (is (= 5 (#'core/merge-face-counts [1 5 3]))))
-
-;; ─── frames config ────────────────────────────────────────────────────────
-
 (deftest parse-args-extracts-frames
   (let [result (#'core/parse-args ["--frames" "8"])]
     (is (= "8" (:frames result)))))
@@ -258,7 +177,76 @@
        clojure.lang.ExceptionInfo #"Invalid --frames"
        (#'core/default-config {:frames "0"}))))
 
-;; ─── entry point ──────────────────────────────────────────────────────────
+;; ─── organise end-to-end at the tools seam ────────────────────────────
+
+(deftest organize-images-runs-full-pipeline-via-fake-runner
+  (with-temp-dir
+   (fn [dir]
+     (write-file! dir "a.png" "data")
+     (write-file! dir "b.jpg" "data")
+     (let [calls (atom [])
+           config (assoc (#'core/default-config {:images-dir (str dir)})
+                         :run-fn (pipeline-run calls))
+           result (core/organize-images! config)]
+       (is (= 2 (:total result)))
+       (is (= 0 (:skipped result)))
+       (is (= ["cat-meme.png" "cat-meme.jpg"] (mapv :new-name (:results result))))
+       (is (= "funny" (:tags (first (:results result)))))
+       (is (= "cat" (:classes (second (:results result)))))
+       (is (= 1 (:faces (second (:results result)))))
+       (is (some #(and (>= (count (:args %)) 3)
+                       (= ["auge" "--ocr"] (subvec (:args %) 0 2))
+                       (str/ends-with? (nth (:args %) 2) "a.png"))
+                 @calls))
+       (is (some #(and (>= (count (:args %)) 4)
+                       (= ["apfel" "-q" "--permissive" "--schema"]
+                          (subvec (:args %) 0 4)))
+                 @calls))))))
+
+(deftest organize-images-skips-already-tagged
+  (with-temp-dir
+   (fn [dir]
+     (write-file! dir "a.png" "data")
+     (let [calls (atom [])
+           run (fn [args stdin]
+                 (swap! calls conj {:args args :stdin stdin})
+                 (cond
+                   (= "which" (first args)) {:exit 0 :out "" :err ""}
+                   (= "swiftc" (first args)) {:exit 0 :out "" :err ""}
+                   (str/ends-with? (first args) "/tags") {:exit 0 :out "already-funny" :err ""}
+                   :else {:exit 0 :out "" :err ""}))
+           config (assoc (#'core/default-config {:images-dir (str dir)})
+                         :run-fn run)
+           result (core/organize-images! config)]
+       (is (= 0 (:total result)))
+       (is (= 1 (:skipped result)))
+       (is (empty? (:results result)))))))
+
+(deftest organize-images-uses-fallback-name-when-apfel-fails
+  (with-temp-dir
+   (fn [dir]
+     (write-file! dir "a.png" "data")
+     (let [run (fn [args _stdin]
+                 (cond
+                   (= "which" (first args)) {:exit 0 :out "" :err ""}
+                   (= "swiftc" (first args)) {:exit 0 :out "" :err ""}
+                   (str/ends-with? (first args) "/tags") {:exit 0 :out "" :err ""}
+                   (= "auge" (first args))
+                   (case (second args)
+                     "--ocr" {:exit 0 :out (json/write-str {:results {:text "lol"}}) :err ""}
+                     "--classify" {:exit 0 :out (json/write-str
+                                                 {:results {:classifications [{:label "cat" :confidence 0.9}]}})
+                                   :err ""}
+                     "--faces" {:exit 0 :out (json/write-str {:results {:count 1}}) :err ""})
+                   (= "apfel-tag" (first args)) {:exit 0 :out (json/write-str {:tags ["funny"]}) :err ""}
+                   (= "apfel" (first args)) {:exit 1 :out "" :err "safety guardrails"}
+                   :else {:exit 0 :out "" :err ""}))
+           config (assoc (#'core/default-config {:images-dir (str dir)})
+                         :run-fn run)
+           result (core/organize-images! config)]
+       (is (= "lol-1face-cat.png" (:new-name (first (:results result)))))))))
+
+;; ─── entry point ──────────────────────────────────────────────────────
 
 (deftest usage-is-printed-on-help
   (let [output (#'core/usage)]
@@ -266,5 +254,10 @@
     (is (str/includes? output "--frames"))))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (run-tests 'clj-apt-reaction-image.core-test)]
+  (require 'clj-apt-reaction-image.describe-test
+           'clj-apt-reaction-image.tools-test)
+  (let [{:keys [fail error]}
+        (run-tests 'clj-apt-reaction-image.core-test
+                   'clj-apt-reaction-image.describe-test
+                   'clj-apt-reaction-image.tools-test)]
     (System/exit (if (zero? (+ fail error)) 0 1))))
